@@ -145,11 +145,14 @@ typedef struct
 								// throw out the first couple, so the player
 								// doesn't accidentally do something the
 								// first frame
+	int			ackedmovemessages;	// echo of movemessages from the server.
 	usercmd_t	cmd;			// last command sent to the server
 	usercmd_t	pendingcmd;		// accumulated state from mice+joysticks.
 
 // information for local display
 	int			stats[MAX_CL_STATS];	// health, etc
+	float		statsf[MAX_CL_STATS];
+	char		*statss[MAX_CL_STATS];
 	int			items;			// inventory bit flags
 	float	item_gettime[32];	// cl.time of aquiring item, for blinking
 	float		faceanimtime;	// use anim frame if cl.time < this
@@ -225,6 +228,11 @@ typedef struct
 
 	unsigned	protocol; //johnfitz
 	unsigned	protocolflags;
+	unsigned	protocol_pext2;	//spike -- flag of fte protocol extensions
+
+	int ackframes[8];	//big enough to cover burst
+	unsigned int ackframes_count;
+	qboolean requestresend;
 } client_state_t;
 
 

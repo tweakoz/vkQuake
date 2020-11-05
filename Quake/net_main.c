@@ -153,6 +153,14 @@ void NET_FreeQSocket(qsocket_t *sock)
 	sock->disconnected = true;
 }
 
+int NET_QSocketGetSequenceIn (const qsocket_t *s)
+{	//returns the last unreliable sequence that was received
+	return s->unreliableReceiveSequence-1;
+}
+int NET_QSocketGetSequenceOut (const qsocket_t *s)
+{	//returns the next unreliable sequence that will be sent
+	return s->unreliableSendSequence;
+}
 
 double NET_QSocketGetTime (const qsocket_t *s)
 {

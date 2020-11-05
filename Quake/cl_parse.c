@@ -93,6 +93,7 @@ const char *svc_strings[] =
 qboolean warn_about_nehahra_protocol; //johnfitz
 
 extern vec3_t	v_punchangles[2]; //johnfitz
+extern double	v_punchangles_times[2]; //spike -- don't assume 10fps...
 
 //=============================================================================
 
@@ -116,6 +117,7 @@ entity_t	*CL_EntityNum (int num)
 			Host_Error ("CL_EntityNum: %i is an invalid number",num);
 		while (cl.num_entities<=num)
 		{
+			cl_entities[cl.num_entities].baseline = nullentitystate;
 			cl_entities[cl.num_entities].colormap = vid.colormap;
 			cl_entities[cl.num_entities].lerpflags |= LERP_RESETMOVE|LERP_RESETANIM; //johnfitz
 			cl.num_entities++;
@@ -125,6 +127,530 @@ entity_t	*CL_EntityNum (int num)
 	return &cl_entities[num];
 }
 
+static int MSG_ReadSize16 (sizebuf_t *sb)
+{
+	unsigned short ssolid = MSG_ReadShort();
+	if (ssolid == ES_SOLID_BSP)
+		return ssolid;
+	else
+	{
+		int solid = (((ssolid>>7) & 0x1F8) - 32+32768)<<16;	/*up can be negative*/
+		solid|= ((ssolid & 0x1F)<<3);
+		solid|= ((ssolid & 0x3E0)<<10);
+		return solid;
+	}
+}
+static unsigned int CLFTE_ReadDelta(unsigned int entnum, entity_state_t *news, const entity_state_t *olds, const entity_state_t *baseline)
+{
+	unsigned int predbits = 0;
+	unsigned int bits;
+	
+	bits = MSG_ReadByte();
+	if (bits & UF_EXTEND1)
+		bits |= MSG_ReadByte()<<8;
+	if (bits & UF_EXTEND2)
+		bits |= MSG_ReadByte()<<16;
+	if (bits & UF_EXTEND3)
+		bits |= MSG_ReadByte()<<24;
+
+	if (cl_shownet.value >= 3)
+		Con_SafePrintf("%3i:     Update %4i 0x%x\n", msg_readcount, entnum, bits);
+
+	if (bits & UF_RESET)
+	{
+//		Con_Printf("%3i: Reset %i @ %i\n", msg_readcount, entnum, cls.netchan.incoming_sequence);
+		*news = *baseline;
+	}
+	else if (!olds)
+	{
+		/*reset got lost, probably the data will be filled in later - FIXME: we should probably ignore this entity*/
+		Con_DPrintf("New entity %i without reset\n", entnum);
+		*news = nullentitystate;
+	}
+	else
+		*news = *olds;
+	
+	if (bits & UF_FRAME)
+	{
+		if (bits & UF_16BIT)
+			news->frame = MSG_ReadShort();
+		else
+			news->frame = MSG_ReadByte();
+	}
+
+	if (bits & UF_ORIGINXY)
+	{
+		news->origin[0] = MSG_ReadCoord(cl.protocolflags);
+		news->origin[1] = MSG_ReadCoord(cl.protocolflags);
+	}
+	if (bits & UF_ORIGINZ)
+		news->origin[2] = MSG_ReadCoord(cl.protocolflags);
+
+	if ((bits & UF_PREDINFO) && !(cl.protocol_pext2 & PEXT2_PREDINFO))
+	{
+		//predicted stuff gets more precise angles
+		if (bits & UF_ANGLESXZ)
+		{
+			news->angles[0] = MSG_ReadAngle16(cl.protocolflags);
+			news->angles[2] = MSG_ReadAngle16(cl.protocolflags);
+		}
+		if (bits & UF_ANGLESY)
+			news->angles[1] = MSG_ReadAngle16(cl.protocolflags);
+	}
+	else
+	{
+		if (bits & UF_ANGLESXZ)
+		{
+			news->angles[0] = MSG_ReadAngle(cl.protocolflags);
+			news->angles[2] = MSG_ReadAngle(cl.protocolflags);
+		}
+		if (bits & UF_ANGLESY)
+			news->angles[1] = MSG_ReadAngle(cl.protocolflags);
+	}
+
+	if ((bits & (UF_EFFECTS | UF_EFFECTS2)) == (UF_EFFECTS | UF_EFFECTS2))
+		news->effects = MSG_ReadLong();
+	else if (bits & UF_EFFECTS2)
+		news->effects = (unsigned short)MSG_ReadShort();
+	else if (bits & UF_EFFECTS)
+		news->effects = MSG_ReadByte();
+
+//	news->movement[0] = 0;
+//	news->movement[1] = 0;
+//	news->movement[2] = 0;
+	news->velocity[0] = 0;
+	news->velocity[1] = 0;
+	news->velocity[2] = 0;
+	if (bits & UF_PREDINFO)
+	{
+		predbits = MSG_ReadByte();
+
+		if (predbits & UFP_FORWARD)
+			/*news->movement[0] =*/ MSG_ReadShort();
+		//else
+		//	news->movement[0] = 0;
+		if (predbits & UFP_SIDE)
+			/*news->movement[1] =*/ MSG_ReadShort();
+		//else
+		//	news->movement[1] = 0;
+		if (predbits & UFP_UP)
+			/*news->movement[2] =*/ MSG_ReadShort();
+		//else
+		//	news->movement[2] = 0;
+		if (predbits & UFP_MOVETYPE)
+			news->pmovetype = MSG_ReadByte();
+		if (predbits & UFP_VELOCITYXY)
+		{
+			news->velocity[0] = MSG_ReadShort();
+			news->velocity[1] = MSG_ReadShort();
+		}
+		else
+		{
+			news->velocity[0] = 0;
+			news->velocity[1] = 0;
+		}
+		if (predbits & UFP_VELOCITYZ)
+			news->velocity[2] = MSG_ReadShort();
+		else
+			news->velocity[2] = 0;
+		if (predbits & UFP_MSEC)	//the msec value is how old the update is (qw clients normally predict without the server running an update every frame)
+			/*news->msec =*/ MSG_ReadByte();
+		//else
+		//	news->msec = 0;
+
+		if (cl.protocol_pext2 & PEXT2_PREDINFO)
+		{
+			if (predbits & UFP_VIEWANGLE)
+			{
+				if (bits & UF_ANGLESXZ)
+				{
+					/*news->vangle[0] =*/ MSG_ReadShort();
+					/*news->vangle[2] =*/ MSG_ReadShort();
+				}
+				if (bits & UF_ANGLESY)
+					/*news->vangle[1] =*/ MSG_ReadShort();
+			}
+		}
+		else
+		{
+			if (predbits & UFP_WEAPONFRAME_OLD)
+			{
+				int wframe;
+				wframe = MSG_ReadByte();
+				if (wframe & 0x80)
+					wframe = (wframe & 127) | (MSG_ReadByte()<<7);
+			}
+		}
+	}
+	else
+	{
+		//news->msec = 0;
+	}
+
+	if (!(predbits & UFP_VIEWANGLE) || !(cl.protocol_pext2 & PEXT2_PREDINFO))
+	{/*
+		if (bits & UF_ANGLESXZ)
+			news->vangle[0] = ANGLE2SHORT(news->angles[0] * ((bits & UF_PREDINFO)?-3:-1));
+		if (bits & UF_ANGLESY)
+			news->vangle[1] = ANGLE2SHORT(news->angles[1]);
+		if (bits & UF_ANGLESXZ)
+			news->vangle[2] = ANGLE2SHORT(news->angles[2]);
+		*/
+	}
+
+	if (bits & UF_MODEL)
+	{
+		if (bits & UF_16BIT)
+			news->modelindex = MSG_ReadShort();
+		else
+			news->modelindex = MSG_ReadByte();
+	}
+	if (bits & UF_SKIN)
+	{
+		if (bits & UF_16BIT)
+			news->skin = MSG_ReadShort();
+		else
+			news->skin = MSG_ReadByte();
+	}
+	if (bits & UF_COLORMAP)
+		news->colormap = MSG_ReadByte();
+
+	if (bits & UF_SOLID)
+		/*news->solidsize =*/ MSG_ReadSize16(&net_message);
+
+	if (bits & UF_FLAGS)
+		news->eflags = MSG_ReadByte();
+
+	if (bits & UF_ALPHA)
+		news->alpha = (MSG_ReadByte()+1)&0xff;
+	if (bits & UF_SCALE)
+		news->scale = MSG_ReadByte();
+	if (bits & UF_BONEDATA)
+	{
+		unsigned char fl = MSG_ReadByte();
+		if (fl & 0x80)
+		{
+			//this is NOT finalized
+			int i;
+			int bonecount = MSG_ReadByte();
+			//short *bonedata = AllocateBoneSpace(newp, bonecount, &news->boneoffset);
+			for (i = 0; i < bonecount*7; i++)
+				/*bonedata[i] =*/ MSG_ReadShort();
+			//news->bonecount = bonecount;
+		}
+		//else
+			//news->bonecount = 0;	//oo, it went away.
+		if (fl & 0x40)
+		{
+			/*news->basebone =*/ MSG_ReadByte();
+			/*news->baseframe =*/ MSG_ReadShort();
+		}
+		/*else
+		{
+			news->basebone = 0;
+			news->baseframe = 0;
+		}*/
+
+		//fixme: basebone, baseframe, etc.
+		if (fl & 0x3f)
+			Host_EndGame("unsupported entity delta info\n");
+	}
+//	else if (news->bonecount)
+//	{	//still has bone data from the previous frame.
+//		short *bonedata = AllocateBoneSpace(newp, news->bonecount, &news->boneoffset);
+//		memcpy(bonedata, oldp->bonedata+olds->boneoffset, sizeof(short)*7*news->bonecount);
+//	}
+
+	if (bits & UF_DRAWFLAGS)
+	{
+		int drawflags = MSG_ReadByte();
+		if ((drawflags & /*MLS_MASK*/7) == /*MLS_ABSLIGHT*/7)
+			/*news->abslight =*/ MSG_ReadByte();
+		//else
+		//	news->abslight = 0;
+		//news->drawflags = drawflags;
+	}
+	if (bits & UF_TAGINFO)
+	{
+		/*news->tagentity =*/ MSG_ReadEntity(cl.protocol_pext2);
+		/*news->tagindex =*/ MSG_ReadByte();
+	}
+	if (bits & UF_LIGHT)
+	{
+		/*news->light[0] =*/ MSG_ReadShort();
+		/*news->light[1] =*/ MSG_ReadShort();
+		/*news->light[2] =*/ MSG_ReadShort();
+		/*news->light[3] =*/ MSG_ReadShort();
+		/*news->lightstyle =*/ MSG_ReadByte();
+		/*news->lightpflags =*/ MSG_ReadByte();
+	}
+	if (bits & UF_TRAILEFFECT)
+	{
+		unsigned short v = MSG_ReadShort();
+		/*news->emiteffectnum = 0;*/
+		/*news->traileffectnum = v & 0x3fff;*/
+		if (v & 0x8000)
+			/*news->emiteffectnum = */MSG_ReadShort() /*& 0x3fff*/;
+		/*if (news->traileffectnum >= MAX_PARTICLETYPES)
+			news->traileffectnum = 0;
+		if (news->emiteffectnum >= MAX_PARTICLETYPES)
+			news->emiteffectnum = 0;*/
+	}
+
+	if (bits & UF_COLORMOD)
+	{
+		news->colormod[0] = MSG_ReadByte();
+		news->colormod[1] = MSG_ReadByte();
+		news->colormod[2] = MSG_ReadByte();
+	}
+	if (bits & UF_GLOW)
+	{
+		/*news->glowsize =*/ MSG_ReadByte();
+		/*news->glowcolour =*/ MSG_ReadByte();
+		/*news->glowmod[0] =*/ MSG_ReadByte();
+		/*news->glowmod[1] =*/ MSG_ReadByte();
+		/*news->glowmod[2] =*/ MSG_ReadByte();
+	}
+	if (bits & UF_FATNESS)
+		/*news->fatness =*/ MSG_ReadByte();
+	if (bits & UF_MODELINDEX2)
+	{
+		if (bits & UF_16BIT)
+			/*news->modelindex2 =*/ MSG_ReadShort();
+		else
+			/*news->modelindex2 =*/ MSG_ReadByte();
+	}
+	if (bits & UF_GRAVITYDIR)
+	{
+		/*news->gravitydir[0] =*/ MSG_ReadByte();
+		/*news->gravitydir[1] =*/ MSG_ReadByte();
+	}
+	if (bits & UF_UNUSED2)
+	{
+		Host_EndGame("UF_UNUSED2 bit\n");
+	}
+	if (bits & UF_UNUSED1)
+	{
+		Host_EndGame("UF_UNUSED1 bit\n");
+	}
+	return bits;
+}
+static void CLFTE_ParseBaseline(entity_state_t *es)
+{
+	CLFTE_ReadDelta(0, es, &nullentitystate, &nullentitystate);
+}
+
+//called with both fte+dp deltas
+static void CL_EntitiesDeltaed(void)
+{
+	int			newnum;
+	qmodel_t	*model;
+	qboolean	forcelink;
+	entity_t	*ent;
+	int			skin;
+
+	for (newnum = 1; newnum < cl.num_entities; newnum++)
+	{
+		ent = CL_EntityNum(newnum);
+		if (!ent->update_type)
+			continue;	//not interested in this one
+
+		if (ent->msgtime != cl.mtime[1])
+			forcelink = true;	// no previous frame to lerp from
+		else
+			forcelink = false;
+
+		//johnfitz -- lerping
+		if (ent->msgtime + 0.2 < cl.mtime[0]) //more than 0.2 seconds since the last message (most entities think every 0.1 sec)
+			ent->lerpflags |= LERP_RESETANIM; //if we missed a think, we'd be lerping from the wrong frame
+
+		ent->msgtime = cl.mtime[0];
+
+		skin = ent->netstate.skin;
+		if (skin != ent->skinnum)
+		{
+			ent->skinnum = skin;
+			if (newnum > 0 && newnum <= cl.maxclients)
+				R_TranslateNewPlayerSkin (newnum - 1); //johnfitz -- was R_TranslatePlayerSkin
+		}
+		ent->effects = ent->netstate.effects;
+
+	// shift the known values for interpolation
+		VectorCopy (ent->msg_origins[0], ent->msg_origins[1]);
+		VectorCopy (ent->msg_angles[0], ent->msg_angles[1]);
+
+		ent->msg_origins[0][0] = ent->netstate.origin[0];
+		ent->msg_angles[0][0] = ent->netstate.angles[0];
+		ent->msg_origins[0][1] = ent->netstate.origin[1];
+		ent->msg_angles[0][1] = ent->netstate.angles[1];
+		ent->msg_origins[0][2] = ent->netstate.origin[2];
+		ent->msg_angles[0][2] = ent->netstate.angles[2];
+
+		//johnfitz -- lerping for movetype_step entities
+		if (ent->netstate.eflags & EFLAGS_STEP)
+		{
+			ent->lerpflags |= LERP_MOVESTEP;
+			ent->forcelink = true;
+		}
+		else
+			ent->lerpflags &= ~LERP_MOVESTEP;
+
+		ent->alpha = ent->netstate.alpha;
+		ent->lerpflags &= ~LERP_FINISH;
+
+		model = cl.model_precache[ent->netstate.modelindex];
+		if (model != ent->model)
+		{
+			ent->model = model;
+		// automatic animation (torches, etc) can be either all together
+		// or randomized
+			if (model)
+			{
+				if (model->synctype == ST_RAND)
+					ent->syncbase = (float)(rand()&0x7fff) / 0x7fff;
+				else
+					ent->syncbase = 0.0;
+			}
+			else
+				forcelink = true;	// hack to make null model players work
+			if (newnum > 0 && newnum <= cl.maxclients)
+				R_TranslateNewPlayerSkin (newnum - 1); //johnfitz -- was R_TranslatePlayerSkin
+
+			ent->lerpflags |= LERP_RESETANIM; //johnfitz -- don't lerp animation across model changes
+		}
+		ent->frame = ent->netstate.frame;
+
+		if ( forcelink )
+		{	// didn't have an update last message
+			VectorCopy (ent->msg_origins[0], ent->msg_origins[1]);
+			VectorCopy (ent->msg_origins[0], ent->origin);
+			VectorCopy (ent->msg_angles[0], ent->msg_angles[1]);
+			VectorCopy (ent->msg_angles[0], ent->angles);
+			ent->forcelink = true;
+		}
+	}
+}
+
+static void CLFTE_ParseEntitiesUpdate(void)
+{
+	int newnum;
+	qboolean removeflag;
+	entity_t *ent;
+	float newtime;
+
+	//so the server can know when we got it, and guess which frames we didn't get
+	if (cls.netcon && cl.ackframes_count < sizeof(cl.ackframes)/sizeof(cl.ackframes[0]))
+		cl.ackframes[cl.ackframes_count++] = NET_QSocketGetSequenceIn(cls.netcon);
+
+	if (cl.protocol_pext2 & PEXT2_PREDINFO)
+	{
+		int seq = (cl.movemessages&0xffff0000) | (unsigned short)MSG_ReadShort();	//an ack from our input sequences. strictly ascending-or-equal
+		if (seq > cl.movemessages)
+			seq -= 0x10000;	//check for cl.movemessages overflowing the low 16 bits, and compensate.
+		cl.ackedmovemessages = seq;
+	}
+
+	newtime = MSG_ReadFloat ();
+	if (newtime != cl.mtime[0])
+	{	//don't mess up lerps if the server is splitting entities into multiple packets.
+		cl.mtime[1] = cl.mtime[0];
+		cl.mtime[0] = newtime;
+	}
+
+	for (;;)
+	{
+		newnum = (unsigned short)(short)MSG_ReadShort();
+		removeflag = !!(newnum & 0x8000);
+		if (newnum & 0x4000)
+			newnum = (newnum & 0x3fff) | (MSG_ReadByte()<<14);
+		else
+			newnum &= ~0x8000;
+
+		if ((!newnum && !removeflag) || msg_badread)
+			break;
+
+		ent = CL_EntityNum(newnum);
+
+		if (removeflag)
+		{	//removal.
+			if (cl_shownet.value >= 3)
+				Con_SafePrintf("%3i:     Remove %i\n", msg_readcount, newnum);
+
+			if (!newnum)
+			{
+				/*removal of world - means forget all entities, aka a full reset*/
+				if (cl_shownet.value >= 3)
+					Con_SafePrintf("%3i:     Reset all\n", msg_readcount);
+				for (newnum = 1; newnum < cl.num_entities; newnum++)
+				{
+					CL_EntityNum(newnum)->netstate.pmovetype = 0;
+					CL_EntityNum(newnum)->model = NULL;
+				}
+				cl.requestresend = false;	//we got it.
+				continue;
+			}
+			ent->update_type = false; //no longer valid
+			ent->model = NULL;
+			continue;
+		}
+		else if (ent->update_type)
+		{	//simple update
+			CLFTE_ReadDelta(newnum, &ent->netstate, &ent->netstate, &ent->baseline);
+		}
+		else
+		{	//we had no previous copy of this entity...
+			ent->update_type = true;
+			CLFTE_ReadDelta(newnum, &ent->netstate, NULL, &ent->baseline);
+
+			//stupid interpolation junk.
+			ent->lerpflags |= LERP_RESETMOVE|LERP_RESETANIM;
+		}
+	}
+
+	CL_EntitiesDeltaed();
+
+	if (cl.protocol_pext2 & PEXT2_PREDINFO)
+	{	//stats should normally be sent before the entity data.
+		extern cvar_t v_gunkick;
+		VectorCopy (cl.mvelocity[0], cl.mvelocity[1]);
+		ent = CL_EntityNum(cl.viewentity);
+		cl.mvelocity[0][0] = ent->netstate.velocity[0]*(1/8.0);
+		cl.mvelocity[0][1] = ent->netstate.velocity[1]*(1/8.0);
+		cl.mvelocity[0][2] = ent->netstate.velocity[2]*(1/8.0);
+		cl.onground = (ent->netstate.eflags & EFLAGS_ONGROUND)?true:false;
+
+
+		if (v_gunkick.value == 1)
+		{	//truncate away any extra precision, like vanilla/qs would.
+			cl.punchangle[0] = cl.stats[STAT_PUNCHANGLE_X];
+			cl.punchangle[1] = cl.stats[STAT_PUNCHANGLE_Y];
+			cl.punchangle[2] = cl.stats[STAT_PUNCHANGLE_Z];
+		}
+		else
+		{	//woo, more precision
+			cl.punchangle[0] = cl.statsf[STAT_PUNCHANGLE_X];
+			cl.punchangle[1] = cl.statsf[STAT_PUNCHANGLE_Y];
+			cl.punchangle[2] = cl.statsf[STAT_PUNCHANGLE_Z];
+		}
+		if (v_punchangles[0][0] != cl.punchangle[0] || v_punchangles[0][1] != cl.punchangle[1] || v_punchangles[0][2] != cl.punchangle[2])
+		{
+			v_punchangles_times[1] = v_punchangles_times[0];
+			v_punchangles_times[0] = newtime;
+
+			VectorCopy (v_punchangles[0], v_punchangles[1]);
+			VectorCopy (cl.punchangle, v_punchangles[0]);
+		}
+	}
+
+	if (!cl.requestresend)
+	{
+		if (cls.signon == SIGNONS - 1)
+		{	// first update is the final signon stage
+			cls.signon = SIGNONS;
+			CL_SignonReply ();
+		}
+	}
+}
 
 /*
 ==================
@@ -152,6 +678,24 @@ void CL_ParseStartSoundPacket(void)
 		attenuation = MSG_ReadByte () / 64.0;
 	else
 		attenuation = DEFAULT_SOUND_PACKET_ATTENUATION;
+
+	//fte's sound extensions
+	if (cl.protocol_pext2 & PEXT2_REPLACEMENTDELTAS)
+	{
+		//spike -- our mixer can't deal with these, so just parse and ignore
+		if (field_mask & SND_FTE_PITCHADJ)
+			MSG_ReadByte();	//percentage
+		if (field_mask & SND_FTE_TIMEOFS)
+			MSG_ReadShort(); //in ms
+		if (field_mask & SND_FTE_VELOCITY)
+		{
+			MSG_ReadShort(); //1/8th
+			MSG_ReadShort(); //1/8th
+			MSG_ReadShort(); //1/8th
+		}
+	}
+	else if (field_mask & (SND_FTE_MOREFLAGS|SND_FTE_PITCHADJ|SND_FTE_TIMEOFS))
+		Con_Warning("Unknown meaning for sound flags\n");
 
 	//johnfitz -- PROTOCOL_FITZQUAKE
 	if (field_mask & SND_LARGEENTITY)
@@ -258,6 +802,9 @@ void CL_ParseServerInfo (void)
 {
 	const char	*str;
 	int		i;
+	qboolean	gamedirswitchwarning = false;
+	char gamedir[1024];
+	char protname[64];
 	int		nummodels, numsounds;
 	char	model_precache[MAX_MODELS][MAX_QPATH];
 	char	sound_precache[MAX_SOUNDS][MAX_QPATH];
@@ -275,7 +822,19 @@ void CL_ParseServerInfo (void)
 	CL_ClearState ();
 
 // parse protocol version number
-	i = MSG_ReadLong ();
+	for(;;)
+	{
+		i = MSG_ReadLong ();
+		if (i == PROTOCOL_FTE_PEXT2)
+		{
+			cl.protocol_pext2 = MSG_ReadLong();
+			if (cl.protocol_pext2 & ~PEXT2_ACCEPTED_CLIENT)
+				Host_Error ("Server returned FTE2 protocol extensions that are not supported (%#x)", cl.protocol_pext2 & ~PEXT2_SUPPORTED_CLIENT);
+			continue;
+		}
+		break;
+	}
+
 	//johnfitz -- support multiple protocols
 	if (i != PROTOCOL_NETQUAKE && i != PROTOCOL_FITZQUAKE && i != PROTOCOL_RMQ) {
 		Con_Printf ("\n"); //because there's no newline after serverinfo print
@@ -297,6 +856,16 @@ void CL_ParseServerInfo (void)
 		}
 	}
 	else cl.protocolflags = 0;
+
+	*gamedir = 0;
+	if (cl.protocol_pext2 & PEXT2_PREDINFO)
+	{
+		q_strlcpy(gamedir, MSG_ReadString(), sizeof(gamedir));
+		if (!COM_GameDirMatches(gamedir))
+		{
+			gamedirswitchwarning = true;
+		}
+	}
 	
 // parse maxclients
 	cl.maxclients = MSG_ReadByte ();
@@ -318,7 +887,11 @@ void CL_ParseServerInfo (void)
 	Con_Printf ("%c%s\n", 2, str);
 
 //johnfitz -- tell user which protocol this is
-	Con_Printf ("Using protocol %i\n", i);
+	if (cl.protocol_pext2 & PEXT2_REPLACEMENTDELTAS)
+		q_snprintf(protname, sizeof(protname), "fte%i", cl.protocol);
+	else
+		q_snprintf(protname, sizeof(protname), "%i", cl.protocol);
+	Con_Printf ("Using protocol %s", protname);
 
 // first we go through and touch all of the precache data that still
 // happens to be in the cache, so precaching something else doesn't
@@ -931,6 +1504,40 @@ void CL_ParseStaticSound (int version) //johnfitz -- added argument
 
 #define SHOWNET(x) if(cl_shownet.value==2)Con_Printf ("%3i:%s\n", msg_readcount-1, x);
 
+static void CL_ParseStatNumeric(int stat, int ival, float fval)
+{
+	if (stat < 0 || stat >= MAX_CL_STATS)
+	{
+		Con_DWarning ("svc_updatestat: %i is invalid\n", stat);
+		return;
+	}
+	cl.stats[stat] = ival;
+	cl.statsf[stat] = fval;
+	if (stat == STAT_VIEWZOOM)
+		vid.recalc_refdef = true;
+	//just assume that they all affect the hud
+	Sbar_Changed ();
+}
+static void CL_ParseStatFloat(int stat, float fval)
+{
+	CL_ParseStatNumeric(stat,fval,fval);
+}
+static void CL_ParseStatInt(int stat, int ival)
+{
+	CL_ParseStatNumeric(stat,ival,ival);
+}
+static void CL_ParseStatString(int stat, const char *str)
+{
+	if (stat < 0 || stat >= MAX_CL_STATS)
+	{
+		Con_DWarning ("svc_updatestat: %i is invalid\n", stat);
+		return;
+	}
+	free(cl.statss[stat]);
+	cl.statss[stat] = strdup(str);
+	//hud doesn't know/care about any of these strings so don't bother invalidating anything.
+}
+
 /*
 =====================
 CL_ParseServerMessage
@@ -942,6 +1549,9 @@ void CL_ParseServerMessage (void)
 	int			i;
 	const char		*str; //johnfitz
 	int			total, j, lastcmd; //johnfitz
+
+	if (!(cl.protocol_pext2 & PEXT2_PREDINFO))
+		cl.onground = false;	// unless the server says otherwise
 
 //
 // if recording demos, copy the message out
@@ -1239,6 +1849,47 @@ void CL_ParseServerMessage (void)
 			CL_ParseStaticSound (2);
 			break;
 		//johnfitz
+
+		//spike -- new deltas (including new fields etc)
+		//stats also changed, and are sent unreliably using the same ack mechanism (which means they're not blocked until the reliables are acked, preventing the need to spam them in every packet).
+		case svcdp_updatestatbyte:
+			if (!(cl.protocol_pext2 & PEXT2_REPLACEMENTDELTAS))
+				Host_Error ("Received svcdp_updatestatbyte but extension not active");
+			i = MSG_ReadByte ();
+			CL_ParseStatInt(i, MSG_ReadByte());
+			break;
+		case svcfte_updatestatstring:
+			if (!(cl.protocol_pext2 & PEXT2_REPLACEMENTDELTAS))
+				Host_Error ("Received svcfte_updatestatstring but extension not active");
+			i = MSG_ReadByte ();
+			CL_ParseStatString(i, MSG_ReadString());
+			break;
+		case svcfte_updatestatfloat:
+			if (!(cl.protocol_pext2 & PEXT2_REPLACEMENTDELTAS))
+				Host_Error ("Received svcfte_updatestatfloat but extension not active");
+			i = MSG_ReadByte ();
+			CL_ParseStatFloat(i, MSG_ReadFloat());
+			break;
+		//static ents get all the new fields too, even if the client will probably ignore most of them, the option is at least there to fix it without updating protocols separately.
+		case svcfte_spawnstatic2:
+			if (!(cl.protocol_pext2 & PEXT2_REPLACEMENTDELTAS))
+				Host_Error ("Received svcfte_spawnstatic2 but extension not active");
+			CL_ParseStatic (6);
+			break;
+		//baselines have all fields. hurrah for the same delta mechanism
+		case svcfte_spawnbaseline2:
+			if (!(cl.protocol_pext2 & PEXT2_REPLACEMENTDELTAS))
+				Host_Error ("Received svcfte_spawnbaseline2 but extension not active");
+			i = MSG_ReadEntity (cl.protocol_pext2);
+			// must use CL_EntityNum() to force cl.num_entities up
+			CL_ParseBaseline (CL_EntityNum(i), 6);
+			break;
+		//ent updates replace svc_time too
+		case svcfte_updateentities:
+			if (!(cl.protocol_pext2 & PEXT2_REPLACEMENTDELTAS))
+				Host_Error ("Received svcfte_updateentities but extension not active");
+			CLFTE_ParseEntitiesUpdate();
+			break;
 		}
 
 		lastcmd = cmd; //johnfitz

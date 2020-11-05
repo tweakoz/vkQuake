@@ -111,6 +111,51 @@ typedef struct client_s
 
 // client known data for deltas
 	int				old_frags;
+
+	qboolean		pextknown;
+	unsigned int	protocol_pext2;
+	unsigned int	resendstatsnum[MAX_CL_STATS/32];	//the stats which need to be resent.
+	unsigned int	resendstatsstr[MAX_CL_STATS/32];	//the stats which need to be resent.
+	int				oldstats_i[MAX_CL_STATS];		//previous values of stats. if these differ from the current values, reflag resendstats.
+	float			oldstats_f[MAX_CL_STATS];		//previous values of stats. if these differ from the current values, reflag resendstats.
+	char			*oldstats_s[MAX_CL_STATS];
+	struct entity_num_state_s{
+		unsigned int num;	//ascending order, there can be gaps.
+		entity_state_t state;
+	} *previousentities;
+	size_t numpreviousentities;
+	size_t maxpreviousentities;
+	unsigned int snapshotresume;
+	unsigned int *pendingentities_bits;	//UF_ flags for each entity
+	size_t numpendingentities;	//realloc if too small
+	unsigned int *pendingcsqcentities_bits;	//SendFlags bitflags for each entity
+					#define	SENDFLAG_PRESENT	0x80000000u	//tracks that we previously sent one of these ents (resulting in a remove if the ent gets remove()d).
+					#define	SENDFLAG_REMOVE		0x40000000u	//for packetloss to signal that we need to resend a remove.
+					#define	SENDFLAG_USABLE		0x00ffffffu	//SendFlags bits that the qc is actually able to use (don't get confused if the mod uses SendFlags=-1).
+	size_t numpendingcsqcentities;	//realloc if too small
+	struct deltaframe_s
+	{	//quick overview of how this stuff actually works:
+		//when the server notices a gap in the ack sequence, we walk through the dropped frames and reflag everything that was dropped.
+		//if the server isn't tracking enough frames, then we just treat those as dropped;
+		//small note: when an entity is new, it re-flags itself as new for the next packet too, this reduces the immediate impact of packetloss on new entities.
+		//reflagged state includes stats updates, entity updates, and entity removes.
+		int				sequence;	//to see if its stale
+		float			timestamp;	
+		unsigned int	resendstatsnum[MAX_CL_STATS/32];
+		unsigned int	resendstatsstr[MAX_CL_STATS/32];
+		struct
+		{
+			unsigned int num;
+			unsigned int bits;
+			unsigned int csqcbits;
+		} *ents;
+		int numents;	//doesn't contain an entry for every entity, just ones that were sent this frame. no 0 bits
+		int maxents;
+	} *frames;
+	size_t numframes;	//preallocated power-of-two
+	int lastacksequence;
+	int lastmovemessage;
+	double lastmovetime;
 } client_t;
 
 
@@ -219,7 +264,7 @@ void SV_Physics (void);
 qboolean SV_CheckBottom (edict_t *ent);
 qboolean SV_movestep (edict_t *ent, vec3_t move, qboolean relink);
 
-void SV_WriteClientdataToMessage (edict_t *ent, sizebuf_t *msg);
+void SV_WriteClientdataToMessage (client_t *client, sizebuf_t *msg);
 
 void SV_MoveToGoal (void);
 

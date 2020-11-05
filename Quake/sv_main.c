@@ -28,35 +28,743 @@ server_static_t	svs;
 
 static char	localmodels[MAX_MODELS][8];	// inline model names for precache
 
-int		sv_protocol = PROTOCOL_FITZQUAKE; //johnfitz
+int				sv_protocol = PROTOCOL_RMQ;//spike -- enough maps need this now that we can probably afford incompatibility with engines that still don't support 999 (vanilla was already broken) -- PROTOCOL_FITZQUAKE; //johnfitz
+unsigned int	sv_protocol_pext2 = PEXT2_SUPPORTED_SERVER; //spike
 
 extern qboolean	pr_alpha_supported; //johnfitz
 
 //============================================================================
+
+static struct entity_num_state_s *snapshot_entstate;
+static size_t snapshot_numents;
+static size_t snapshot_maxents;
+
+void SV_CalcStats(client_t *client, int *statsi, float *statsf, char **statss)
+{
+	edict_t *ent = client->edict;
+	//FIXME: string stats!
+	int items = (int)ent->v.items | ((int)pr_global_struct->serverflags << 28);
+
+	memset(statsi, 0, sizeof(*statsi)*MAX_CL_STATS);
+	memset(statsf, 0, sizeof(*statsf)*MAX_CL_STATS);
+	memset(statss, 0, sizeof(*statss)*MAX_CL_STATS);
+	statsf[STAT_HEALTH] = ent->v.health;
+	statsi[STAT_WEAPON] = SV_ModelIndex(PR_GetString(ent->v.weaponmodel));
+	statsf[STAT_AMMO] = ent->v.currentammo;
+	statsf[STAT_ARMOR] = ent->v.armorvalue;
+	statsf[STAT_WEAPONFRAME] = ent->v.weaponframe;
+	statsf[STAT_SHELLS] = ent->v.ammo_shells;
+	statsf[STAT_NAILS] = ent->v.ammo_nails;
+	statsf[STAT_ROCKETS] = ent->v.ammo_rockets;
+	statsf[STAT_CELLS] = ent->v.ammo_cells;
+	statsf[STAT_ACTIVEWEAPON] = ent->v.weapon;	//sent in a way that does NOT depend upon the current mod...
+
+	if (client->protocol_pext2 & PEXT2_PREDINFO)
+	{	//predinfo also kills clc_clientdata
+		statsi[STAT_ITEMS] = items;
+		statsf[STAT_VIEWHEIGHT] = ent->v.view_ofs[2];
+		statsf[STAT_IDEALPITCH] = ent->v.idealpitch;
+		statsf[STAT_PUNCHANGLE_X] = ent->v.punchangle[0];
+		statsf[STAT_PUNCHANGLE_Y] = ent->v.punchangle[1];
+		statsf[STAT_PUNCHANGLE_Z] = ent->v.punchangle[2];
+	}
+}
+
+/*server-side-only flags that re-use encoding bits*/
+#define UF_REMOVE		UF_16BIT	/*says we removed the entity in this frame*/
+#define UF_MOVETYPE		UF_EFFECTS2	/*this flag isn't present in the header itself*/
+#define UF_RESET2		UF_EXTEND1	/*so new ents are reset multiple times to avoid weird baselines*/
+//#define UF_UNUSED		UF_EXTEND2	/**/
+#define UF_WEAPONFRAME_OLD	UF_EXTEND2
+#define UF_VIEWANGLES	UF_EXTEND3	/**/
+
+static unsigned int SVFTE_DeltaPredCalcBits(entity_state_t *from, entity_state_t *to)
+{
+	unsigned int bits = 0;
+//	if (from && from->pmovetype != to->pmovetype)
+//		bits |= UFP_MOVETYPE;
+
+//	if (to->movement[0])
+//		bits |= UFP_FORWARD;
+//	if (to->movement[1])
+//		bits |= UFP_SIDE;
+//	if (to->movement[2])
+//		bits |= UFP_UP;
+	if (to->velocity[0])
+		bits |= UFP_VELOCITYXY;
+	if (to->velocity[1])
+		bits |= UFP_VELOCITYXY;
+	if (to->velocity[2])
+		bits |= UFP_VELOCITYZ;
+//	if (to->msec)
+//		bits |= UFP_MSEC;
+
+	return bits;
+}
+
+static unsigned int MSGFTE_DeltaCalcBits(entity_state_t *from, entity_state_t *to)
+{
+	unsigned int bits = 0;
+
+	if (from->pmovetype != to->pmovetype)
+		bits |= UF_PREDINFO|UF_MOVETYPE;
+	{
+		if (SVFTE_DeltaPredCalcBits(from, to))
+			bits |= UF_PREDINFO;
+
+		//moving players get extra data forced upon them which is not deltatracked
+		if ((bits & UF_PREDINFO) && (from->velocity[0] || from->velocity[1] || from->velocity[2]))
+		{
+			//if we've got player movement then write the origin anyway, to cover packetloss
+			bits |= UF_ORIGINXY | UF_ORIGINZ;
+		}
+	}
+
+	if (to->origin[0] != from->origin[0])
+		bits |= UF_ORIGINXY;
+	if (to->origin[1] != from->origin[1])
+		bits |= UF_ORIGINXY;
+	if (to->origin[2] != from->origin[2])
+		bits |= UF_ORIGINZ;
+
+	if (to->angles[0] != from->angles[0])
+		bits |= UF_ANGLESXZ;
+	if (to->angles[1] != from->angles[1])
+		bits |= UF_ANGLESY;
+	if (to->angles[2] != from->angles[2])
+		bits |= UF_ANGLESXZ;
+
+
+	if (to->modelindex != from->modelindex)
+		bits |= UF_MODEL;
+	if (to->frame != from->frame)
+		bits |= UF_FRAME;
+	if (to->skin != from->skin)
+		bits |= UF_SKIN;
+	if (to->colormap != from->colormap)
+		bits |= UF_COLORMAP;
+	if (to->effects != from->effects)
+		bits |= UF_EFFECTS;
+	if (to->eflags != from->eflags)
+		bits |= UF_FLAGS;
+	if (to->scale != from->scale)
+		bits |= UF_SCALE;
+	if (to->alpha != from->alpha)
+		bits |= UF_ALPHA;
+	if (to->colormod[0]!=from->colormod[0]||to->colormod[1]!=from->colormod[1]||to->colormod[2]!=from->colormod[2])
+		bits |= UF_COLORMOD;
+
+	return bits;
+}
+
+static void MSGFTE_WriteEntityUpdate(unsigned int bits, entity_state_t *state, sizebuf_t *msg, unsigned int pext2, unsigned int protocolflags)
+{
+	unsigned int predbits = 0;
+	if (bits & UF_MOVETYPE)
+	{
+		bits &= ~UF_MOVETYPE;
+		predbits |= UFP_MOVETYPE;
+	}
+	if (pext2 & PEXT2_PREDINFO)
+	{
+		if (bits & UF_VIEWANGLES)
+		{
+			bits &= ~UF_VIEWANGLES;
+			bits |= UF_PREDINFO;
+			predbits |= UFP_VIEWANGLE;
+		}
+	}
+	else
+	{
+		if (bits & UF_VIEWANGLES)
+		{
+			bits &= ~UF_VIEWANGLES;
+			bits |= UF_PREDINFO;
+		}
+		if (bits & UF_WEAPONFRAME_OLD)
+		{
+			bits &= ~UF_WEAPONFRAME_OLD;
+			predbits |= UFP_WEAPONFRAME_OLD;
+		}
+	}
+
+	bits &= ~UF_BONEDATA;
+
+	/*check if we need more precision for some things*/
+	if ((bits & UF_MODEL) && state->modelindex > 255)
+		bits |= UF_16BIT;
+	if ((bits & UF_FRAME) && state->frame > 255)
+		bits |= UF_16BIT;
+
+	/*convert effects bits to higher lengths if needed*/
+	if (bits & UF_EFFECTS)
+	{
+		if (state->effects & 0xffff0000) /*both*/
+			bits |= UF_EFFECTS | UF_EFFECTS2;
+		else if (state->effects & 0x0000ff00) /*2 only*/
+			bits = (bits & ~UF_EFFECTS) | UF_EFFECTS2;
+	}
+	if (bits & 0xff000000)
+		bits |= UF_EXTEND3;
+	if (bits & 0x00ff0000)
+		bits |= UF_EXTEND2;
+	if (bits & 0x0000ff00)
+		bits |= UF_EXTEND1;
+
+	MSG_WriteByte(msg, (bits>>0) & 0xff);
+	if (bits & UF_EXTEND1)
+		MSG_WriteByte(msg, (bits>>8) & 0xff);
+	if (bits & UF_EXTEND2)
+		MSG_WriteByte(msg, (bits>>16) & 0xff);
+	if (bits & UF_EXTEND3)
+		MSG_WriteByte(msg, (bits>>24) & 0xff);
+
+	if (bits & UF_FRAME)
+	{
+		if (bits & UF_16BIT)
+			MSG_WriteShort(msg, state->frame);
+		else
+			MSG_WriteByte(msg, state->frame);
+	}
+	if (bits & UF_ORIGINXY)
+	{
+		MSG_WriteCoord(msg, state->origin[0], protocolflags);
+		MSG_WriteCoord(msg, state->origin[1], protocolflags);
+	}
+	if (bits & UF_ORIGINZ)
+		MSG_WriteCoord(msg, state->origin[2], protocolflags);
+
+	if ((bits & UF_PREDINFO) && !(pext2 & PEXT2_PREDINFO))
+	{	/*if we have pred info, (always) use more precise angles*/
+		if (bits & UF_ANGLESXZ)
+		{
+			MSG_WriteAngle16(msg, state->angles[0], protocolflags);
+			MSG_WriteAngle16(msg, state->angles[2], protocolflags);
+		}
+		if (bits & UF_ANGLESY)
+			MSG_WriteAngle16(msg, state->angles[1], protocolflags);
+	}
+	else
+	{
+		if (bits & UF_ANGLESXZ)
+		{
+			MSG_WriteAngle(msg, state->angles[0], protocolflags);
+			MSG_WriteAngle(msg, state->angles[2], protocolflags);
+		}
+		if (bits & UF_ANGLESY)
+			MSG_WriteAngle(msg, state->angles[1], protocolflags);
+	}
+
+	if ((bits & (UF_EFFECTS|UF_EFFECTS2)) == (UF_EFFECTS|UF_EFFECTS2))
+		MSG_WriteLong(msg, state->effects);
+	else if (bits & UF_EFFECTS2)
+		MSG_WriteShort(msg, state->effects);
+	else if (bits & UF_EFFECTS)
+		MSG_WriteByte(msg, state->effects);
+
+	if (bits & UF_PREDINFO)
+	{
+		/*movetype is set above somewhere*/
+		predbits |= SVFTE_DeltaPredCalcBits(NULL, state);
+
+		MSG_WriteByte(msg, predbits);
+		if (predbits & UFP_MOVETYPE)
+			MSG_WriteByte(msg, state->pmovetype);
+		if (predbits & UFP_VELOCITYXY)
+		{
+			MSG_WriteShort(msg, state->velocity[0]);
+			MSG_WriteShort(msg, state->velocity[1]);
+		}
+		if (predbits & UFP_VELOCITYZ)
+			MSG_WriteShort(msg, state->velocity[2]);
+	}
+
+	if (bits & UF_MODEL)
+	{
+		if (bits & UF_16BIT)
+			MSG_WriteShort(msg, state->modelindex);
+		else
+			MSG_WriteByte(msg, state->modelindex);
+	}
+	if (bits & UF_SKIN)
+	{
+		if (bits & UF_16BIT)
+			MSG_WriteShort(msg, state->skin);
+		else
+			MSG_WriteByte(msg, state->skin);
+	}
+	if (bits & UF_COLORMAP)
+		MSG_WriteByte(msg, state->colormap & 0xff);
+	if (bits & UF_FLAGS)
+		MSG_WriteByte(msg, state->eflags);
+
+	if (bits & UF_ALPHA)
+		MSG_WriteByte(msg, (state->alpha-1)&0xff);
+	if (bits & UF_SCALE)
+		MSG_WriteByte(msg, state->scale);
+
+	if (bits & UF_COLORMOD)
+	{
+		MSG_WriteByte(msg, state->colormod[0]);
+		MSG_WriteByte(msg, state->colormod[1]);
+		MSG_WriteByte(msg, state->colormod[2]);
+	}
+}
+
+void SVFTE_DestroyFrames(client_t *client)
+{
+	int i;
+	for (i = 0; i < MAX_CL_STATS; i++)
+	{
+		if (!client->oldstats_s[i])
+			continue;
+		free(client->oldstats_s[i]);
+		client->oldstats_s[i] = 0;
+	}
+	if (client->previousentities)
+		free(client->previousentities);
+	client->previousentities = NULL;
+	client->numpreviousentities = 0;
+	client->maxpreviousentities = 0;
+
+
+	if (client->pendingentities_bits)
+		free(client->pendingentities_bits);
+	client->pendingentities_bits = NULL;
+	client->numpendingentities = 0;
+
+	if (client->pendingcsqcentities_bits)
+		free(client->pendingcsqcentities_bits);
+	client->pendingcsqcentities_bits = NULL;
+	client->numpendingcsqcentities = 0;
+
+	while(client->numframes > 0)
+	{
+		client->numframes--;
+		free(client->frames[client->numframes].ents);
+	}
+	if (client->frames)
+		free(client->frames);
+	client->frames = NULL;
+
+	client->lastacksequence = 0;
+}
+static void SVFTE_SetupFrames(client_t *client)
+{
+	size_t fr;
+	//the client will clear out their stats on receipt of the svc_serverinfo packet.
+	//we won't send any reliables until they receive it
+	//so it should be enough to just clear these here, and they'll get their new stats with the first entity update once they're spawned
+	memset(client->oldstats_i, 0, sizeof(client->oldstats_i));
+	memset(client->oldstats_f, 0, sizeof(client->oldstats_f));
+	client->lastmovemessage = 0;	//it'll clear this too
+
+	if (!client->protocol_pext2)
+	{
+		SVFTE_DestroyFrames(client);
+		return;
+	}
+
+	client->numframes = 64;	//must be power-of-two
+	client->frames = malloc(sizeof(*client->frames) * client->numframes);
+	client->lastacksequence = (int)0x80000000;
+	memset(client->frames, 0, sizeof(*client->frames) * client->numframes);
+	for (fr = 0; fr < client->numframes; fr++)
+		client->frames[fr].sequence = client->lastacksequence;
+
+	client->numpendingentities = sv.num_edicts;
+	client->pendingentities_bits = calloc(client->numpendingentities, sizeof(*client->pendingentities_bits));
+
+	client->pendingentities_bits[0] = UF_REMOVE;
+
+
+	client->numpendingcsqcentities = sv.num_edicts;
+	client->pendingcsqcentities_bits = calloc(client->numpendingcsqcentities, sizeof(*client->pendingcsqcentities_bits));
+}
+static void SVFTE_DroppedFrame(client_t *client, int sequence)
+{
+	int i;
+	struct deltaframe_s *frame = &client->frames[sequence&(client->numframes-1)];
+	if (frame->sequence != sequence)
+		return;	//this frame was stale... client is running too far behind. we'll probably be spamming resends as a result.
+	frame->sequence = -1;
+	//flag their stats for resend
+	for (i = 0; i < MAX_CL_STATS/32; i++)
+	{
+		client->resendstatsnum[i] |= frame->resendstatsnum[i];
+		client->resendstatsstr[i] |= frame->resendstatsstr[i];
+	}
+	//flag their various entities as needing a resend too.
+	for (i = 0; i < frame->numents; i++)
+		client->pendingentities_bits[frame->ents[i].num] |= frame->ents[i].bits;
+
+}
+void SVFTE_Ack(client_t *client, int sequence)
+{	//any gaps in the sequence need to considered dropped
+	struct deltaframe_s *frame;
+	int dropseq = client->lastacksequence+1;
+	if (!client->numframes)
+		return;	//client shouldn't be using this.
+	if (sequence == -1)
+		client->pendingentities_bits[0] |= UF_REMOVE;	//client wants a full resend. which might happen from it just starting to record a demo, saving it from writing all the deltas out.
+	if (sequence < client->lastacksequence)
+	{
+//		else Con_SafePrintf("dupe or stale ack (%s, %i->%i)\n", client->name, client->lastacksequence, sequence);
+		return;	//panic
+	}
+	if ((unsigned)(dropseq-sequence) >= client->numframes)
+		dropseq = sequence - client->numframes;
+	while(dropseq < sequence)
+		SVFTE_DroppedFrame(client, dropseq++);
+	client->lastacksequence = sequence;
+
+	frame = &client->frames[sequence&(client->numframes-1)];
+	if (frame->sequence >= 0)
+	{
+		frame->sequence = -1;
+		host_client->ping_times[host_client->num_pings%NUM_PING_TIMES] = sv.time - frame->timestamp;
+		host_client->num_pings++;
+	}
+}
+static void SVFTE_WriteStats(client_t *client, sizebuf_t *msg)
+{
+	int statsi[MAX_CL_STATS];
+	float statsf[MAX_CL_STATS];
+	char *statss[MAX_CL_STATS];
+	int i;
+	struct deltaframe_s *frame;
+	int sequence = NET_QSocketGetSequenceOut(client->netconnection);
+	int maxstats;
+
+	if (client->protocol_pext2 & PEXT2_REPLACEMENTDELTAS)
+		maxstats = MAX_CL_STATS;
+	else
+		maxstats = 32;
+
+	frame = &client->frames[sequence&(client->numframes-1)];
+
+	if (frame->sequence == sequence-(int)client->numframes)	//client is getting behind... this may get really spammy, lets hope it clears up at some point
+		SVFTE_DroppedFrame(client, frame->sequence);
+
+	//figure out the current values in a nice easy way (yay for copying to make arrays easier!)
+	SV_CalcStats(client, statsi, statsf, statss);
+
+	for (i = 0; i < maxstats; i++)
+	{
+		//small cleanup
+		if (!statsi[i])
+			statsi[i] =	statsf[i];
+		else
+			statsf[i] =	0;//statsi[i];
+
+		//if it changed flag for sending
+		if (statsi[i] != client->oldstats_i[i] || statsf[i] != client->oldstats_f[i])
+		{
+			client->oldstats_i[i] = statsi[i];
+			client->oldstats_f[i] = statsf[i];
+			client->resendstatsnum[i/32] |= 1u<<(i&31);
+		}
+
+		if (statss[i] || client->oldstats_s[i])
+		{
+			const char *os = client->oldstats_s[i];
+			const char *ns = statss[i];
+			if (!ns)	ns="";
+			if (!os)	os="";
+			if (strcmp(os,ns))
+			{
+				client->resendstatsstr[i/32] |= 1u<<(i&31);
+				free(client->oldstats_s[i]);
+				client->oldstats_s[i] = strdup(ns);
+			}
+		}
+
+		//if its flagged then unflag it, log it, and send it
+		if (client->resendstatsnum[i/32] & (1u<<(i&31)))
+		{
+			client->resendstatsnum[i/32] &= ~(1u<<(i&31));
+			frame->resendstatsnum[i/32] |= 1u<<(i&31);
+
+			if ((double)statsi[i] != statsf[i] && statsf[i])
+			{	//didn't round nicely, so send as a float
+				MSG_WriteByte(msg, svcfte_updatestatfloat);
+				MSG_WriteByte(msg, i);
+				MSG_WriteFloat(msg, statsf[i]);
+			}
+			else
+			{
+				if (statsi[i] < 0 || statsi[i] > 255)
+				{	//needs to be big
+					MSG_WriteByte(msg, svc_updatestat);
+					MSG_WriteByte(msg, i);
+					MSG_WriteLong(msg, statsi[i]);
+				}
+				else
+				{	//can be fairly small
+					MSG_WriteByte(msg, svcdp_updatestatbyte);
+					MSG_WriteByte(msg, i);
+					MSG_WriteByte(msg, statsi[i]);
+				}
+			}
+		}
+		//if its flagged then unflag it, log it, and send it
+		if (client->resendstatsstr[i/32] & (1u<<(i&31)))
+		{
+			client->resendstatsstr[i/32] &= ~(1u<<(i&31));
+			frame->resendstatsstr[i/32] |= 1u<<(i&31);
+
+			MSG_WriteByte(msg, svcfte_updatestatstring);
+			MSG_WriteByte(msg, i);
+			if (statss[i])
+				MSG_WriteString(msg, statss[i]);
+			else
+				MSG_WriteString(msg, NULL);
+		}
+	}
+}
+static void SVFTE_CalcEntityDeltas(client_t *client)
+{
+	struct entity_num_state_s *olds, *news, *oldstop, *newstop;
+
+	if ((int)client->numpendingentities < sv.num_edicts)
+	{
+		int newmax = sv.num_edicts+64;
+		client->pendingentities_bits = realloc(client->pendingentities_bits, sizeof(*client->pendingentities_bits) * newmax);
+		memset(client->pendingentities_bits+client->numpendingentities, 0, sizeof(*client->pendingentities_bits)*(newmax-client->numpendingentities));
+		client->numpendingentities = newmax;
+	}
+
+	//if we're clearing the list and starting from scratch, just wipe all lingering state
+	if (client->pendingentities_bits[0] & UF_REMOVE)
+	{
+		client->numpreviousentities = 0;
+		client->pendingentities_bits[0] = UF_REMOVE;
+	}
+
+	news = snapshot_entstate;
+	newstop = news + snapshot_numents;
+	olds = client->previousentities;
+	oldstop = olds+client->numpreviousentities;
+
+	//we have two sets of entity state, pvs culled etc already.
+	//figure out which flags changed,
+	for (;;)
+	{
+		if (olds==oldstop && news==newstop)
+			break;
+		if (news==newstop || (olds!=oldstop && olds->num < news->num))
+		{
+			//old ent is no longer visible, so flag for removal.
+			client->pendingentities_bits[olds->num] = UF_REMOVE;
+			olds++;
+		}
+		else if (olds==oldstop || (news!=newstop && news->num < olds->num))
+		{
+			//new ent is new this frame, so reset everything.
+			client->pendingentities_bits[news->num] = UF_RESET | UF_RESET2;
+			//don't need to calc the other bits here, resets are enough
+			news++;
+		}
+		else
+		{	//simple entity delta
+			//its flagged for removing, that's weird... must be some killer packetloss. turn that back into a reset or something
+			if (client->pendingentities_bits[news->num] & UF_REMOVE)
+				client->pendingentities_bits[news->num] = (client->pendingentities_bits[news->num] & ~UF_REMOVE) | UF_RESET2;
+			client->pendingentities_bits[news->num] |= MSGFTE_DeltaCalcBits(&olds->state, &news->state);
+			news++;
+			olds++;
+		}
+	}
+
+	//now we know what flags to apply, the client needs a copy of that state for the next frame too.
+	//outgoing data can just read off these states too, instead of needing to hit the edicts memory (which may be spread over multiple allocations, yay cache).
+	//to avoid a potentially large memcopy, I'm just going to swap these buffers. 
+	olds = client->previousentities;
+	oldstop = olds + client->maxpreviousentities;
+
+	client->previousentities = snapshot_entstate;
+	client->numpreviousentities = snapshot_numents;
+	client->maxpreviousentities = snapshot_maxents;
+
+	snapshot_entstate = olds;
+	snapshot_numents = 0;
+	snapshot_maxents = oldstop-olds;
+}
+static void SVFTE_WriteEntitiesToClient(client_t *client, sizebuf_t *msg, size_t overflowsize)
+{
+	struct entity_num_state_s *state, *stateend;
+	unsigned int bits, logbits;
+	size_t entnum;
+	int sequence = NET_QSocketGetSequenceOut(client->netconnection);
+	size_t origmaxsize = msg->maxsize;
+	size_t rollbacksize;	//I'm too lazy to figure out sizes (especially if someone updates this for bone states or whatever)
+	struct deltaframe_s *frame = &client->frames[sequence&(client->numframes-1)];
+	frame->sequence = sequence;	//so we know that it wasn't stale later.
+	frame->timestamp = sv.time;
+
+	msg->maxsize = overflowsize;
+
+	state = client->previousentities;
+	stateend = state + client->numpreviousentities;
+
+	MSG_WriteByte(msg, svcfte_updateentities);
+
+	frame->numents = 0;
+	if (client->protocol_pext2 & PEXT2_PREDINFO)
+		MSG_WriteShort(msg, (client->lastmovemessage&0xffff));
+	MSG_WriteFloat(msg, frame->timestamp);	//should be the time the last physics frame was run.
+	for (entnum = client->snapshotresume; entnum < client->numpendingentities; entnum++)
+	{
+		bits = client->pendingentities_bits[entnum];
+		if (!(bits & ~UF_RESET2))
+			continue;	//nothing to send (if reset2 is still set, then leave it pending until there's more data
+
+		rollbacksize = msg->cursize;
+		client->pendingentities_bits[entnum] = 0;
+		logbits = 0;
+		if (bits & UF_REMOVE)
+		{
+			if (entnum > 0x3fff)
+			{
+				MSG_WriteShort(msg, 0xc000|(entnum&0x3fff));
+				MSG_WriteByte(msg, entnum>>14);
+			}
+			else
+				MSG_WriteShort(msg, 0x8000|entnum);
+			logbits = UF_REMOVE;
+		}
+		else
+		{
+			while (state<stateend && state->num < entnum)
+				state++;
+			if (state<stateend && state->num == entnum)
+			{
+				if (bits & UF_RESET2)
+				{
+					/*if reset2, then this is the second packet sent to the client and should have a forced reset (but which isn't tracked)*/
+					logbits = bits & ~(UF_RESET|UF_RESET2);
+					bits = UF_RESET | MSGFTE_DeltaCalcBits(&EDICT_NUM(entnum)->baseline, &state->state);
+				}
+				else if (bits & UF_RESET)
+				{
+					/*flag the entity for the next packet, so we always get two resets when it appears, to reduce the effects of packetloss on seeing rockets etc*/
+					client->pendingentities_bits[entnum] = UF_RESET2;
+					bits = UF_RESET | MSGFTE_DeltaCalcBits(&EDICT_NUM(entnum)->baseline, &state->state);
+					logbits = UF_RESET;
+				}
+				else
+					logbits = bits;
+
+				if (entnum >= 0x4000)
+				{
+					MSG_WriteShort(msg, 0x4000|(entnum&0x3fff));
+					MSG_WriteByte(msg, entnum>>14);
+				}
+				else
+					MSG_WriteShort(msg, entnum);
+				MSGFTE_WriteEntityUpdate(bits, &state->state, msg, client->protocol_pext2, sv.protocolflags);
+			}
+		}
+
+		if ((size_t)msg->cursize + 2 > origmaxsize)
+		{
+			msg->cursize = rollbacksize;	//roll back
+			client->pendingentities_bits[entnum] |= logbits;	//make sure those bits get re-applied later.
+			break;
+		}
+		if (frame->numents == frame->maxents)
+		{
+			frame->maxents += 64;
+			frame->ents = realloc(frame->ents, sizeof(*frame->ents)*frame->maxents);
+		}
+		frame->ents[frame->numents].num = entnum;
+		frame->ents[frame->numents].bits = logbits;
+		frame->ents[frame->numents].csqcbits = 0;
+		frame->numents++;
+	}
+	msg->maxsize = origmaxsize;
+	MSG_WriteShort(msg, 0);	//eom
+
+	//remember how far we got, so we can keep things flushed, instead of only updating the first N entities.
+	client->snapshotresume = entnum;
+
+
+	if (msg->cursize > 1024 && dev_peakstats.packetsize <= 1024)
+		Con_DWarning ("%i byte packet exceeds standard limit of 1024.\n", msg->cursize);
+	dev_stats.packetsize = msg->cursize;
+	dev_peakstats.packetsize = q_max(msg->cursize, dev_peakstats.packetsize);
+}
 
 /*
 ===============
 SV_Protocol_f
 ===============
 */
-void SV_Protocol_f (void)
+static void SV_Protocol_f (void)
 {
 	int i;
+	const char *s;
+	int prot, pext2;
+
+	prot = sv_protocol;
+	pext2 = sv_protocol_pext2;
 
 	switch (Cmd_Argc())
 	{
 	case 1:
-		Con_Printf ("\"sv_protocol\" is \"%i\"\n", sv_protocol);
+		//"FTE+15" or "15", just to be explicit about it
+		Con_Printf ("\"sv_protocol\" is \"%s%i\"\n", sv_protocol_pext2?"fte":"", sv_protocol);
 		break;
 	case 2:
-		i = atoi(Cmd_Argv(1));
+		s = Cmd_Argv(1);
+		if (!q_strncasecmp(s, "FTE", 3))
+		{
+			s += 3;
+			if (*s == '+' || *s == '-')
+				s++;
+			pext2 = PEXT2_SUPPORTED_SERVER;
+		}
+		else if (!q_strncasecmp(s, "+", 3))
+		{
+			s += 1;
+			pext2 = PEXT2_SUPPORTED_SERVER;
+		}
+		else if (!q_strncasecmp(s, "Base", 4))
+		{
+			s+= 4;
+			if (*s == '+' || *s == '-')
+				s++;
+			pext2 = 0;
+		}
+		else if (*s == '-')
+		{
+			s++;
+			pext2 = 0;
+		}
+
+		i = strtol(s, (char**)&s, 0);
+		if (*s == '-')
+		{
+			pext2 = 0;
+		}
+		else if (*s == '+')
+		{
+			pext2 = PEXT2_SUPPORTED_SERVER;
+		}
+
 		if (i != PROTOCOL_NETQUAKE && i != PROTOCOL_FITZQUAKE && i != PROTOCOL_RMQ)
-			Con_Printf ("sv_protocol must be %i or %i or %i\n", PROTOCOL_NETQUAKE, PROTOCOL_FITZQUAKE, PROTOCOL_RMQ);
+			Con_Printf ("sv_protocol must be %i or %i or %i.\nProtocol may be prefixed with FTE+ or Base- to enable/disable FTE extensions.\n", PROTOCOL_NETQUAKE, PROTOCOL_FITZQUAKE, PROTOCOL_RMQ);
 		else
 		{
 			sv_protocol = i;
+			sv_protocol_pext2 = pext2;
 			if (sv.active)
-				Con_Printf ("changes will not take effect until the next level load.\n");
+			{
+				if (prot == sv_protocol && pext2 == sv_protocol_pext2)
+					Con_Printf ("specified protocol already active.\n");
+				else
+					Con_Printf ("changes will not take effect until the next level load.\n");
+			}
 		}
 		break;
 	default:
@@ -129,7 +837,7 @@ void SV_Init (void)
 				sv_protocol, PROTOCOL_NETQUAKE, PROTOCOL_FITZQUAKE, PROTOCOL_RMQ);
 		return; /* silence compiler */
 	}
-	Sys_Printf ("Server using protocol %i (%s)\n", sv_protocol, p);
+	Sys_Printf ("Server using protocol %i%s (%s%s)\n", sv_protocol, sv_protocol_pext2?"+":"", sv_protocol_pext2?"FTE-":"", p);
 }
 
 /*
@@ -288,6 +996,19 @@ void SV_SendServerinfo (client_t *client)
 	char			message[2048];
 	int				i; //johnfitz
 
+	if (!sv_protocol_pext2)
+	{	//server disabled pext completely, don't bother trying.
+		//make sure we try reenabling it again on the next map though.
+		client->pextknown = false;
+	}
+	else if (!client->pextknown)
+	{
+		MSG_WriteByte (&client->message, svc_stufftext);
+		MSG_WriteString (&client->message, "cmd pext\n");
+		client->sendsignon = true;
+		return;
+	}
+
 	MSG_WriteByte (&client->message, svc_print);
 	sprintf (message, "%c\nFITZQUAKE %1.2f SERVER (%i CRC)\n", 2, FITZQUAKE_VERSION, pr_crc); //johnfitz -- include fitzquake version
 	MSG_WriteString (&client->message,message);
@@ -338,6 +1059,50 @@ void SV_SendServerinfo (client_t *client)
 	client->spawned = false;		// need prespawn, spawn, etc
 }
 
+void SV_Pext_f(void)
+{
+	//this only makes sense on the server. the clientside part only takes the form of 'cmd pext', for compat with clients that don't support this.
+	if (cmd_source != src_client)
+	{
+		if (!cls.state)
+		{
+			Con_Printf ("Not connected\n");
+			return;
+		}
+		Con_Printf ("Current Protocols:\n");
+		if (cl.protocol_pext2 & PEXT2_PREDINFO)
+			Con_Printf ("  Replacement Stats ('predinfo')\n");
+		if (cl.protocol == PROTOCOL_NETQUAKE)
+			Con_Printf ("  vanilla(15)\n");
+		else if (cl.protocol == PROTOCOL_FITZQUAKE)
+			Con_Printf ("  fitzquake(666)\n");
+		else if (cl.protocol == PROTOCOL_RMQ)
+			Con_Printf ("  rmq(999)\n");		
+		else
+			Con_Printf ("  unknown protocol(%i)\n", cl.protocol);
+		return;
+	}
+
+	if (!host_client->pextknown && !host_client->spawned)
+	{
+		int i;
+		int key;
+		int value;
+		for (i = 1; i < Cmd_Argc(); i+=2)
+		{
+			key = strtoul(Cmd_Argv(i), NULL, 0);
+			value = strtoul(Cmd_Argv(i+1), NULL, 0);
+
+			if (key == PROTOCOL_FTE_PEXT2)
+				host_client->protocol_pext2 = value & PEXT2_SUPPORTED_SERVER;
+			//else some other extension that we don't know
+		}
+
+		host_client->pextknown = true;
+		SV_SendServerinfo(host_client);
+	}
+}
+
 /*
 ================
 SV_ConnectClient
@@ -378,6 +1143,9 @@ void SV_ConnectClient (int clientnum)
 	client->message.data = client->msgbuf;
 	client->message.maxsize = sizeof(client->msgbuf);
 	client->message.allowoverflow = true;		// we can catch it
+
+	client->pextknown = false;
+	client->protocol_pext2 = 0;
 
 	if (sv.loadgame)
 		memcpy (client->spawn_parms, spawn_parms, sizeof(spawn_parms));
@@ -554,8 +1322,9 @@ SV_WriteEntitiesToClient
 
 =============
 */
-void SV_WriteEntitiesToClient (edict_t	*clent, sizebuf_t *msg)
+void SV_WriteEntitiesToClient (client_t *client, sizebuf_t *msg)
 {
+	edict_t	*clent = client->edict;
 	int		e, i;
 	int		bits;
 	byte	*pvs;
@@ -766,17 +1535,14 @@ void SV_CleanupEnts (void)
 
 /*
 ==================
-SV_WriteClientdataToMessage
+SV_WriteDamageToMessage
 
 ==================
 */
-void SV_WriteClientdataToMessage (edict_t *ent, sizebuf_t *msg)
+void SV_WriteDamageToMessage(edict_t *ent, sizebuf_t *msg)
 {
-	int		bits;
-	int		i;
 	edict_t	*other;
-	int		items;
-	eval_t	*val;
+	int		i;
 
 //
 // send a damage message
@@ -807,6 +1573,21 @@ void SV_WriteClientdataToMessage (edict_t *ent, sizebuf_t *msg)
 			MSG_WriteAngle (msg, ent->v.angles[i], sv.protocolflags );
 		ent->v.fixangle = 0;
 	}
+}
+
+/*
+==================
+SV_WriteClientdataToMessage
+
+==================
+*/
+void SV_WriteClientdataToMessage (client_t *client, sizebuf_t *msg)
+{
+	edict_t	*ent = client->edict;
+	int		bits;
+	int		i;
+	int		items;
+	eval_t	*val;
 
 	bits = 0;
 
@@ -965,22 +1746,53 @@ qboolean SV_SendClientDatagram (client_t *client)
 		msg.maxsize = DATAGRAM_MTU;
 	//johnfitz
 
-	MSG_WriteByte (&msg, svc_time);
-	MSG_WriteFloat (&msg, sv.time);
+	host_client = client;
+	if (client->spawned)
+	{
+		sv_player = client->edict;
 
-// add the client specific data to the datagram
-	SV_WriteClientdataToMessage (client->edict, &msg);
+		if (client->protocol_pext2 & PEXT2_REPLACEMENTDELTAS)
+		{
+			SV_WriteDamageToMessage(client->edict, &msg);
+			if (!(client->protocol_pext2 & PEXT2_PREDINFO))
+				SV_WriteClientdataToMessage (client, &msg);
+			else
+				SVFTE_WriteStats(client, &msg);
+			SVFTE_WriteEntitiesToClient(client, &msg, sizeof(buf));	//must always write some data, or the stats will break
 
-	SV_WriteEntitiesToClient (client->edict, &msg);
+			//this delta protocol doesn't wipe old state just because there's a new packet.
+			//the server isn't required to sync with the client frames either
+			//so we can just spam multiple packets to keep our udp data under the MTU
+			while (client->snapshotresume < client->numpendingentities)
+			{
+				NET_SendUnreliableMessage (client->netconnection, &msg);
+				SZ_Clear(&msg);
+				SVFTE_WriteEntitiesToClient(client, &msg, sizeof(buf));
+			}
+		}
+		else
+		{
+			MSG_WriteByte (&msg, svc_time);
+			MSG_WriteFloat (&msg, sv.time);
+			if (client->protocol_pext2 & PEXT2_PREDINFO)
+				MSG_WriteShort(&msg, (client->lastmovemessage&0xffff));
 
-// copy the server datagram if there is space
-	if (msg.cursize + sv.datagram.cursize < msg.maxsize)
-		SZ_Write (&msg, sv.datagram.data, sv.datagram.cursize);
+	// add the client specific data to the datagram
+			SV_WriteDamageToMessage (client->edict, &msg);
+			SV_WriteClientdataToMessage (client, &msg);
+
+			SV_WriteEntitiesToClient (client, &msg);
+		}
+
+	// copy the server datagram if there is space
+		if (msg.cursize + sv.datagram.cursize < msg.maxsize)
+			SZ_Write (&msg, sv.datagram.data, sv.datagram.cursize);
+	}
 
 // send the datagram
-	if (NET_SendUnreliableMessage (client->netconnection, &msg) == -1)
+	if (msg.cursize && NET_SendUnreliableMessage (client->netconnection, &msg) == -1)
 	{
-		SV_DropClient (true);// if the message couldn't send, kick off
+		SV_DropClient (false);// if the message couldn't send, kick off
 		return false;
 	}
 

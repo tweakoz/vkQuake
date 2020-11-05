@@ -923,6 +923,20 @@ float MSG_ReadAngle16 (unsigned int flags)
 }
 //johnfitz
 
+unsigned int MSG_ReadEntity(unsigned int pext2)
+{
+	unsigned int e = (unsigned short)MSG_ReadShort();
+	if (pext2 & PEXT2_REPLACEMENTDELTAS)
+	{
+		if (e & 0x8000)
+		{
+			e = (e & 0x7fff) << 8;
+			e |= MSG_ReadByte();
+		}
+	}
+	return e;
+}
+
 //===========================================================================
 
 void SZ_Alloc (sizebuf_t *buf, int startsize)
@@ -1388,6 +1402,23 @@ static void FitzTest_f (void)
 }
 #endif
 
+
+entity_state_t nullentitystate;
+static void COM_SetupNullState(void)
+{
+	//the null state has some specific default values
+//	nullentitystate.drawflags = /*SCALE_ORIGIN_ORIGIN*/96;
+	nullentitystate.colormod[0] = 32;
+	nullentitystate.colormod[1] = 32;
+	nullentitystate.colormod[2] = 32;
+//	nullentitystate.glowmod[0] = 32;
+//	nullentitystate.glowmod[1] = 32;
+//	nullentitystate.glowmod[2] = 32;
+	nullentitystate.alpha = 0;	//fte has 255 by default, with 0 for invisible. fitz uses 1 for invisible, 0 default, and 255=full alpha
+	nullentitystate.scale = 16;
+//	nullentitystate.solidsize = 0;//ES_SOLID_BSP;
+}
+
 /*
 ================
 COM_Init
@@ -1439,6 +1470,8 @@ void COM_Init (void)
 #ifdef _DEBUG
 	Cmd_AddCommand ("fitztest", FitzTest_f); //johnfitz
 #endif
+
+	COM_SetupNullState();
 }
 
 
@@ -2030,6 +2063,45 @@ const char *COM_GetGameNames(qboolean full)
 	}
 	return com_gamenames;
 //	return COM_SkipPath(com_gamedir);
+}
+
+//if either contain id1 then that gets ignored
+qboolean COM_GameDirMatches(const char *tdirs)
+{
+	int gnl = strlen(GAMENAME);
+	const char *odirs = COM_GetGameNames(false);
+
+	//ignore any core paths.
+	if (!strncmp(tdirs, GAMENAME, gnl) && (tdirs[gnl] == ';' || !tdirs[gnl]))
+	{
+		tdirs+=gnl;
+		if (*tdirs == ';')
+			tdirs++;
+	}
+	if (!strncmp(odirs, GAMENAME, gnl) && (odirs[gnl] == ';' || !odirs[gnl]))
+	{
+		odirs+=gnl;
+		if (*odirs == ';')
+			odirs++;
+	}
+	//skip any qw in there from quakeworld (remote servers should really be skipping this, unless its maybe the only one in the path).
+	if (!strncmp(tdirs, "qw;", 3) || !strcmp(tdirs, "qw"))
+	{
+		tdirs+=2;
+		if (*tdirs==';')
+			tdirs++;
+	}
+	if (!strncmp(odirs, "qw;", 3) || !strcmp(odirs, "qw"))	//need to cope with ourselves setting it that way too, just in case.
+	{
+		odirs+=2;
+		if (*odirs==';')
+			odirs++;
+	}
+
+	//okay, now check it properly
+	if (!strcmp(odirs, tdirs))
+		return true;
+	return false;
 }
 
 /*
