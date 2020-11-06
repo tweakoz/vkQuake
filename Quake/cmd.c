@@ -24,6 +24,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 
+cvar_t	cl_nopext = {"cl_nopext","0",CVAR_NONE};	//Spike -- prevent autodetection of protocol extensions, so that servers fall back to only their base protocol (without needing to reconfigure the server. Requires reconnect.
 void Cmd_ForwardToServer (void);
 
 #define	MAX_ALIAS_NAME	32
@@ -830,6 +831,24 @@ void Cmd_ForwardToServer (void)
 	{
 		SZ_Print (&cls.message, Cmd_Argv(0));
 		SZ_Print (&cls.message, " ");
+	}
+	else
+	{
+		//hack zone for compat.
+		//stuffcmd("cmd foo\n") is a good way to query the client to see if it knows foo because the server is guarenteed a response even if it doesn't understand it, saving a timeout
+		if (!strcmp(Cmd_Args(), "protocols"))
+		{	//server asked us for a list of protocol numbers that we claim to support. this allows cool servers like fte to autodetect higher limits etc.
+			//servers may assume that the client's preferred protocol will be listed first.
+			SZ_Print (&cls.message, va("protocols %i %i %i", PROTOCOL_RMQ, PROTOCOL_FITZQUAKE, PROTOCOL_NETQUAKE));
+			return;
+		}
+		if (!strcmp(Cmd_Args(), "pext") && !cl_nopext.value)
+		{	//server asked us for a key+value list of the extensions+attributes we support
+			SZ_Print (&cls.message, va("pext"
+						" %#x %#x",
+						PROTOCOL_FTE_PEXT2, PEXT2_SUPPORTED_CLIENT));
+			return;
+		}
 	}
 	if (Cmd_Argc() > 1)
 		SZ_Print (&cls.message, Cmd_Args());

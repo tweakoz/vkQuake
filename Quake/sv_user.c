@@ -568,6 +568,8 @@ nextmsg:
 					ret = 1;
 				else if (q_strncasecmp(s, "ban", 3) == 0)
 					ret = 1;
+				else if (q_strncasecmp(s, "pext", 4) == 0)
+					ret = 1;
 
 				if (ret == 1)
 					Cmd_ExecuteString (s, src_client);
@@ -580,7 +582,12 @@ nextmsg:
 				return false;
 
 			case clc_move:
+			if (!host_client->spawned)
+				return true;	//this is to suck up any stale moves on map changes, so we don't get confused (quite so easily) when protocols are changed between maps
 				SV_ReadClientMove (&host_client->cmd);
+				break;
+			case clcdp_ackframe:
+				SVFTE_Ack(host_client, MSG_ReadLong());
 				break;
 			}
 		}

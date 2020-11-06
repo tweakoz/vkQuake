@@ -303,7 +303,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define	clc_disconnect	2
 #define	clc_move		3		// [usercmd_t]
 #define	clc_stringcmd	4		// [string] message
-
+#define clcdp_ackframe	50		// [long] frame sequence. reused by fte replacement deltas
 //
 // temp entity events
 //
@@ -358,12 +358,16 @@ extern entity_state_t nullentitystate;	//note: not all null.
 
 typedef struct
 {
+	float	servertime;
+	float	seconds;	//servertime-previous->servertime
 	vec3_t	viewangles;
 
 // intended velocities
 	float	forwardmove;
 	float	sidemove;
 	float	upmove;
+
+	unsigned int	sequence;
 } usercmd_t;
 
 #endif	/* _QUAKE_PROTOCOL_H */

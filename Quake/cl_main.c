@@ -704,6 +704,9 @@ void CL_SendCmd (void)
 		cmd.forwardmove	+= cl.pendingcmd.forwardmove;
 		cmd.sidemove	+= cl.pendingcmd.sidemove;
 		cmd.upmove		+= cl.pendingcmd.upmove;
+		cmd.sequence	= cl.movemessages;
+		cmd.servertime	= cl.time;
+		cmd.seconds		= cmd.servertime - cl.pendingcmd.servertime;
 
 	// send the unreliable message
 		CL_SendMove (&cmd);

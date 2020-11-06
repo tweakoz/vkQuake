@@ -695,6 +695,8 @@ static void SVFTE_WriteEntitiesToClient(client_t *client, sizebuf_t *msg, size_t
 	dev_peakstats.packetsize = q_max(msg->cursize, dev_peakstats.packetsize);
 }
 
+static void SV_Pext_f(void);
+
 /*
 ===============
 SV_Protocol_f
@@ -813,6 +815,7 @@ void SV_Init (void)
 	Cvar_RegisterVariable (&sv_freezenonclients);
 	Cvar_RegisterVariable (&sv_altnoclip); //johnfitz
 
+	Cmd_AddCommand("pext", SV_Pext_f);
 	Cmd_AddCommand ("sv_protocol", &SV_Protocol_f); //johnfitz
 
 	for (i=0 ; i<MAX_MODELS ; i++)
@@ -1008,12 +1011,21 @@ void SV_SendServerinfo (client_t *client)
 		client->sendsignon = true;
 		return;
 	}
+	client->protocol_pext2 &= sv_protocol_pext2;
+
+	if (!(client->protocol_pext2 & PEXT2_REPLACEMENTDELTAS))
+		client->protocol_pext2 &= ~PEXT2_PREDINFO;	//stats can't be deltaed if there's no deltas, so just pretend its not supported on its own.
 
 	MSG_WriteByte (&client->message, svc_print);
 	sprintf (message, "%c\nFITZQUAKE %1.2f SERVER (%i CRC)\n", 2, FITZQUAKE_VERSION, pr_crc); //johnfitz -- include fitzquake version
 	MSG_WriteString (&client->message,message);
 
 	MSG_WriteByte (&client->message, svc_serverinfo);
+	if (client->protocol_pext2)
+	{	//pext stuff takes the form of modifiers to an underlaying protocol
+		MSG_WriteLong (&client->message, PROTOCOL_FTE_PEXT2);
+		MSG_WriteLong (&client->message, client->protocol_pext2);	//active extensions that the client needs to look out for
+	}
 	MSG_WriteLong (&client->message, sv.protocol); //johnfitz -- sv.protocol instead of PROTOCOL_VERSION
 	
 	if (sv.protocol == PROTOCOL_RMQ)
@@ -1021,7 +1033,15 @@ void SV_SendServerinfo (client_t *client)
 		// mh - now send protocol flags so that the client knows the protocol features to expect
 		MSG_WriteLong (&client->message, sv.protocolflags);
 	}
-	
+
+	if (client->protocol_pext2 & PEXT2_PREDINFO)
+	{
+		//if multiple gamedirs were used, we should list all the active ones eg: "id1;hipnotic;rogue;quoth;mod".
+		//fixme: engine-specific forced gamedirs like id1/ or qw/ or fte/ are redundant, so don't bother listing them
+		//we don't really track that stuff, so I'm just going to report the last one
+		MSG_WriteString(&client->message, COM_GetGameNames(false));
+	}
+
 	MSG_WriteByte (&client->message, svs.maxclients);
 
 	if (!coop.value && deathmatch.value)
@@ -1056,6 +1076,9 @@ void SV_SendServerinfo (client_t *client)
 	MSG_WriteByte (&client->message, 1);
 
 	client->sendsignon = true;
+
+	SVFTE_SetupFrames(client);
+
 	client->spawned = false;		// need prespawn, spawn, etc
 }
 

@@ -346,6 +346,13 @@ void CL_SendMove (const usercmd_t *cmd)
 	buf.cursize = 0;
 	buf.data = data;
 
+	for (i = 0; i < cl.ackframes_count; i++)
+	{
+		MSG_WriteByte(&buf, clcdp_ackframe);
+		MSG_WriteLong(&buf, cl.ackframes[i]);
+	}
+	cl.ackframes_count = 0;
+
 	if (cmd) 
 	{
 		cl.cmd = *cmd;
@@ -355,11 +362,17 @@ void CL_SendMove (const usercmd_t *cmd)
 	//
 		MSG_WriteByte (&buf, clc_move);
 
-		MSG_WriteFloat (&buf, cl.mtime[0]);	// so server can get ping times
+		if (cl.protocol_pext2 & PEXT2_PREDINFO)
+		{
+			MSG_WriteShort(&buf, cl.movemessages&0xffff);	//server will ack this once it has been applied to the player's entity state
+			MSG_WriteFloat (&buf, cmd->servertime);	// so server can get cmd timing (pings will be calculated by entframe acks).
+		}
+		else
+			MSG_WriteFloat (&buf, cl.mtime[0]);	// so server can get ping times
 
 		for (i=0 ; i<3 ; i++)
 			//johnfitz -- 16-bit angles for PROTOCOL_FITZQUAKE
-			if (cl.protocol == PROTOCOL_NETQUAKE)
+			if ((cl.protocol == PROTOCOL_NETQUAKE) && !(cl.protocol_pext2 & PEXT2_PREDINFO))
 				MSG_WriteAngle (&buf, cl.viewangles[i], cl.protocolflags);
 			else
 				MSG_WriteAngle16 (&buf, cl.viewangles[i], cl.protocolflags);

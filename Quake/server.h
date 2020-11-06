@@ -244,6 +244,8 @@ void SV_StartSound (edict_t *entity, int channel, const char *sample, int volume
 
 void SV_DropClient (qboolean crash);
 
+void SVFTE_DestroyFrames(client_t *client);
+void SVFTE_Ack(client_t *client, int sequence);
 void SV_SendClientMessages (void);
 void SV_ClearDatagram (void);
 

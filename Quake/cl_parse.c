@@ -668,6 +668,8 @@ void CL_ParseStartSoundPacket(void)
 	int	i;
 
 	field_mask = MSG_ReadByte();
+	if (field_mask & SND_FTE_MOREFLAGS)
+		field_mask |= MSG_ReadByte()<<8;
 
 	if (field_mask & SND_VOLUME)
 		volume = MSG_ReadByte ();
@@ -739,7 +741,7 @@ so the server doesn't disconnect.
 ==================
 */
 static byte	net_olddata[NET_MAXMESSAGE];
-void CL_KeepaliveMessage (void)
+static void CL_KeepaliveMessage (void)
 {
 	float	time;
 	static float lastmsg;
@@ -798,7 +800,7 @@ void CL_KeepaliveMessage (void)
 CL_ParseServerInfo
 ==================
 */
-void CL_ParseServerInfo (void)
+static void CL_ParseServerInfo (void)
 {
 	const char	*str;
 	int		i;
@@ -892,6 +894,7 @@ void CL_ParseServerInfo (void)
 	else
 		q_snprintf(protname, sizeof(protname), "%i", cl.protocol);
 	Con_Printf ("Using protocol %s", protname);
+	Con_Printf ("\n");
 
 // first we go through and touch all of the precache data that still
 // happens to be in the cache, so precaching something else doesn't
@@ -982,6 +985,11 @@ void CL_ParseServerInfo (void)
 	memset(&dev_stats, 0, sizeof(dev_stats));
 	memset(&dev_peakstats, 0, sizeof(dev_peakstats));
 	memset(&dev_overflows, 0, sizeof(dev_overflows));
+
+	cl.requestresend = true;
+	cl.ackframes_count = 0;
+	if (cl.protocol_pext2 & PEXT2_REPLACEMENTDELTAS)
+		cl.ackframes[cl.ackframes_count++] = -1;
 }
 
 /*
@@ -993,11 +1001,11 @@ If an entities model or origin changes from frame to frame, it must be
 relinked.  Other attributes can change without relinking.
 ==================
 */
-void CL_ParseUpdate (int bits)
+static void CL_ParseUpdate (int bits)
 {
 	int		i;
 	qmodel_t	*model;
-	int		modnum;
+	unsigned int	modnum;
 	qboolean	forcelink;
 	entity_t	*ent;
 	int		num;
@@ -1043,6 +1051,7 @@ void CL_ParseUpdate (int bits)
 	//johnfitz
 
 	ent->msgtime = cl.mtime[0];
+	ent->netstate = ent->baseline;
 
 	if (bits & U_MODEL)
 	{
@@ -1445,7 +1454,7 @@ void CL_NewTranslation (int slot)
 CL_ParseStatic
 =====================
 */
-void CL_ParseStatic (int version) //johnfitz -- added a parameter
+static void CL_ParseStatic (int version) //johnfitz -- added a parameter
 {
 	entity_t *ent;
 	int		i;
@@ -1460,6 +1469,7 @@ void CL_ParseStatic (int version) //johnfitz -- added a parameter
 
 // copy it to the current state
 
+	ent->netstate = ent->baseline;
 	ent->model = cl.model_precache[ent->baseline.modelindex];
 	ent->lerpflags |= LERP_RESETANIM; //johnfitz -- lerping
 	ent->frame = ent->baseline.frame;
@@ -1471,6 +1481,7 @@ void CL_ParseStatic (int version) //johnfitz -- added a parameter
 
 	VectorCopy (ent->baseline.origin, ent->origin);
 	VectorCopy (ent->baseline.angles, ent->angles);
+	if (ent->model)
 	R_AddEfrags (ent);
 }
 
@@ -1479,7 +1490,7 @@ void CL_ParseStatic (int version) //johnfitz -- added a parameter
 CL_ParseStaticSound
 ===================
 */
-void CL_ParseStaticSound (int version) //johnfitz -- added argument
+static void CL_ParseStaticSound (int version) //johnfitz -- added argument
 {
 	vec3_t		org;
 	int			sound_num, vol, atten;
@@ -1550,9 +1561,6 @@ void CL_ParseServerMessage (void)
 	const char		*str; //johnfitz
 	int			total, j, lastcmd; //johnfitz
 
-	if (!(cl.protocol_pext2 & PEXT2_PREDINFO))
-		cl.onground = false;	// unless the server says otherwise
-
 //
 // if recording demos, copy the message out
 //
@@ -1561,6 +1569,7 @@ void CL_ParseServerMessage (void)
 	else if (cl_shownet.value == 2)
 		Con_Printf ("------------------\n");
 
+	if (!(cl.protocol_pext2 & PEXT2_PREDINFO))
 	cl.onground = false;	// unless the server says otherwise
 //
 // parse the message
@@ -1605,6 +1614,8 @@ void CL_ParseServerMessage (void)
 		case svc_time:
 			cl.mtime[1] = cl.mtime[0];
 			cl.mtime[0] = MSG_ReadFloat ();
+			if (cl.protocol_pext2 & PEXT2_PREDINFO)
+				MSG_ReadShort();	//input sequence ack.
 			break;
 
 		case svc_clientdata:
@@ -1764,10 +1775,12 @@ void CL_ParseServerMessage (void)
 
 		case svc_killedmonster:
 			cl.stats[STAT_MONSTERS]++;
+			cl.statsf[STAT_MONSTERS] = cl.stats[STAT_MONSTERS];
 			break;
 
 		case svc_foundsecret:
 			cl.stats[STAT_SECRETS]++;
+			cl.statsf[STAT_SECRETS] = cl.stats[STAT_SECRETS];
 			break;
 
 		case svc_updatestat:

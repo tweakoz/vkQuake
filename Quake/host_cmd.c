@@ -1672,6 +1672,8 @@ void Host_Spawn_f (void)
 // send time of update
 	MSG_WriteByte (&host_client->message, svc_time);
 	MSG_WriteFloat (&host_client->message, sv.time);
+	if (host_client->protocol_pext2 & PEXT2_PREDINFO)
+		MSG_WriteShort(&host_client->message, (host_client->lastmovemessage&0xffff));
 
 	for (i = 0, client = svs.clients; i < svs.maxclients; i++, client++)
 	{
