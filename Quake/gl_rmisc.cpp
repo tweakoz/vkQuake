@@ -866,9 +866,9 @@ static void R_AddDynamicBufferGarbage(VkDeviceMemory device_memory, dynbuffer_t 
 		int old_num_memory_garbage = *num_garbage;
 		*num_garbage += 1;
 		if (device_memory_garbage[current_garbage_index] == NULL)
-			device_memory_garbage[current_garbage_index] = malloc(sizeof(VkDeviceMemory) * (*num_garbage));
+			device_memory_garbage[current_garbage_index] = (VkDeviceMemory_T**) malloc(sizeof(VkDeviceMemory) * (*num_garbage));
 		else
-			device_memory_garbage[current_garbage_index] = realloc(device_memory_garbage[current_garbage_index], sizeof(VkDeviceMemory) * (*num_garbage));
+			device_memory_garbage[current_garbage_index] = (VkDeviceMemory_T**) realloc(device_memory_garbage[current_garbage_index], sizeof(VkDeviceMemory) * (*num_garbage));
 		device_memory_garbage[current_garbage_index][old_num_memory_garbage] = device_memory;
 	}
 
@@ -877,9 +877,9 @@ static void R_AddDynamicBufferGarbage(VkDeviceMemory device_memory, dynbuffer_t 
 		int old_num_buffer_garbage = *num_garbage;
 		*num_garbage += NUM_DYNAMIC_BUFFERS;
 		if (buffer_garbage[current_garbage_index] == NULL)
-			buffer_garbage[current_garbage_index] = malloc(sizeof(VkBuffer) * (*num_garbage));
+			buffer_garbage[current_garbage_index] = (VkBuffer_T**) malloc(sizeof(VkBuffer) * (*num_garbage));
 		else
-			buffer_garbage[current_garbage_index] = realloc(buffer_garbage[current_garbage_index], sizeof(VkBuffer) * (*num_garbage));
+			buffer_garbage[current_garbage_index] = (VkBuffer_T**) realloc(buffer_garbage[current_garbage_index], sizeof(VkBuffer) * (*num_garbage));
 		for (int i = 0; i < NUM_DYNAMIC_BUFFERS; ++i)
 			buffer_garbage[current_garbage_index][old_num_buffer_garbage + i] = buffers[i].buffer;
 	}
@@ -890,9 +890,9 @@ static void R_AddDynamicBufferGarbage(VkDeviceMemory device_memory, dynbuffer_t 
 		int old_num_desc_set_garbage = *num_garbage;
 		*num_garbage += 2;
 		if (descriptor_set_garbage[current_garbage_index] == NULL)
-			descriptor_set_garbage[current_garbage_index] = malloc(sizeof(VkDescriptorSet) * (*num_garbage));
+			descriptor_set_garbage[current_garbage_index] = (VkDescriptorSet_T**) malloc(sizeof(VkDescriptorSet) * (*num_garbage));
 		else
-			descriptor_set_garbage[current_garbage_index] = realloc(descriptor_set_garbage[current_garbage_index], sizeof(VkDescriptorSet) * (*num_garbage));
+			descriptor_set_garbage[current_garbage_index] = (VkDescriptorSet_T**) realloc(descriptor_set_garbage[current_garbage_index], sizeof(VkDescriptorSet) * (*num_garbage));
 		for (int i = 0; i < 2; ++i)
 			descriptor_set_garbage[current_garbage_index][old_num_desc_set_garbage + i] = descriptor_sets[i];
 	}

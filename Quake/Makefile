@@ -28,7 +28,7 @@ VORBISLIB=vorbis
 # Helper functions
 # ---------------------------
 
-check_gcc = $(shell if echo | $(CC) $(1) -Werror -S -o /dev/null -xc - > /dev/null 2>&1; then echo "$(1)"; else echo "$(2)"; fi;)
+check_gcc = $(shell if echo | $(CXX) $(1) -Werror -S -o /dev/null -xc - > /dev/null 2>&1; then echo "$(1)"; else echo "$(2)"; fi;)
 
 # ---------------------------
 
@@ -40,10 +40,8 @@ DEBUG   ?= 0
 # build variables
 # ---------------------------
 
-CC ?= gcc
-LINKER = $(CC)
-
-STRIP ?= strip
+CXX ?= g++
+LINKER = $(CXX)
 
 #CPUFLAGS= -mtune=i686
 #CPUFLAGS= -march=pentium4
@@ -51,31 +49,26 @@ STRIP ?= strip
 #CPUFLAGS= -march=atom
 CPUFLAGS=
 DFLAGS ?=
-CFLAGS ?= -Wall -Wno-trigraphs
-CFLAGS += $(CPUFLAGS)
+CCFLAGS ?= -Wall -Wno-trigraphs
+CCFLAGS += $(CPUFLAGS)
 ifneq ($(DEBUG),0)
 DFLAGS += -D_DEBUG
-CFLAGS += -g
+CCFLAGS += -g
 do_strip=
-else
 DFLAGS += -DNDEBUG
-CFLAGS += -O2
-CFLAGS += -std=gnu99
-CFLAGS += $(call check_gcc,-fweb,)
-CFLAGS += $(call check_gcc,-frename-registers,)
+CCFLAGS += -O2
+CCFLAGS += $(call check_gcc,-fweb,)
+CCFLAGS += $(call check_gcc,-frename-registers,)
 cmd_strip=$(STRIP) $(1)
-define do_strip
-	$(call cmd_strip,$(1));
-endef
 endif
 
 ifneq ($(VULKAN_SDK),)
 LDFLAGS += -L$(VULKAN_SDK)/lib
-CFLAGS += -I$(VULKAN_SDK)/include
+CCFLAGS += -I$(VULKAN_SDK)/include
 endif
 
 ifeq ($(DO_USERDIRS),1)
-CFLAGS += -DDO_USERDIRS=1
+CCFLAGS += -DDO_USERDIRS=1
 endif
 
 ### X11BASE only gets used if its in an unusual place
@@ -95,13 +88,13 @@ X11BASE	?= $(X11BASE_GUESS)
 
 ifneq ($(X11BASE),)
 LDFLAGS+= -L$(X11BASE)/lib
-CFLAGS += -I$(X11BASE)/include
+CCFLAGS += -I$(X11BASE)/include
 endif
 
-CFLAGS += -DUSE_SDL2
+CCFLAGS += -DUSE_SDL2
 
 SDL_CONFIG ?= sdl2-config
-SDL_CFLAGS := $(shell $(SDL_CONFIG) --cflags)
+SDL_CCFLAGS := $(shell $(SDL_CONFIG) --cflags)
 SDL_LIBS   := $(shell $(SDL_CONFIG) --libs)
 
 ifeq ($(HOST_OS),sunos)
@@ -139,50 +132,55 @@ endif
 
 CODECLIBS  :=
 ifeq ($(USE_CODEC_WAVE),1)
-CFLAGS+= -DUSE_CODEC_WAVE
+CCFLAGS+= -DUSE_CODEC_WAVE
 endif
 ifeq ($(USE_CODEC_FLAC),1)
-CFLAGS+= -DUSE_CODEC_FLAC
+CCFLAGS+= -DUSE_CODEC_FLAC
 CODECLIBS+= -lFLAC
 endif
 ifeq ($(USE_CODEC_OPUS),1)
 # opus and opusfile put their *.h under <includedir>/opus,
 # but they include the headers without the opus directory
 # prefix and rely on pkg-config. ewww...
-CFLAGS+= -DUSE_CODEC_OPUS
-CFLAGS+= $(shell pkg-config --cflags opusfile)
+CCFLAGS+= -DUSE_CODEC_OPUS
+CCFLAGS+= $(shell pkg-config --cflags opusfile)
 CODECLIBS+= $(shell pkg-config --libs   opusfile)
 endif
 ifeq ($(USE_CODEC_VORBIS),1)
-CFLAGS+= -DUSE_CODEC_VORBIS $(cpp_vorbisdec)
+CCFLAGS+= -DUSE_CODEC_VORBIS $(cpp_vorbisdec)
 CODECLIBS+= $(lib_vorbisdec)
 endif
 ifeq ($(USE_CODEC_MP3),1)
-CFLAGS+= -DUSE_CODEC_MP3
+CCFLAGS+= -DUSE_CODEC_MP3
 CODECLIBS+= $(lib_mp3dec)
 endif
 ifeq ($(USE_CODEC_MIKMOD),1)
-CFLAGS+= -DUSE_CODEC_MIKMOD
+CCFLAGS+= -DUSE_CODEC_MIKMOD
 CODECLIBS+= -lmikmod
 endif
 ifeq ($(USE_CODEC_XMP),1)
-CFLAGS+= -DUSE_CODEC_XMP
+CCFLAGS+= -DUSE_CODEC_XMP
 CODECLIBS+= -lxmp
 endif
 ifeq ($(USE_CODEC_UMX),1)
-CFLAGS+= -DUSE_CODEC_UMX
+CCFLAGS+= -DUSE_CODEC_UMX
 endif
 
 COMMON_LIBS:= -lm
 
 ifneq ($(HOST_OS),darwin)
 COMMON_LIBS+= -lX11-xcb -lvulkan
-CFLAGS+= -DLINUX
+CCFLAGS+= -DLINUX
 else
 	COMMON_LIBS+= -lMoltenVK
 endif
 
 LIBS := $(COMMON_LIBS) $(NET_LIBS) $(CODECLIBS)
+
+# ---------------------------
+
+CXXFLAGS = $(CCFLAGS)
+CXXFLAGS += -std=c++17
 
 # ---------------------------
 # targets
@@ -191,15 +189,6 @@ LIBS := $(COMMON_LIBS) $(NET_LIBS) $(CODECLIBS)
 .PHONY:	clean debug release
 
 DEFAULT_TARGET := vkquake
-
-# ---------------------------
-# rules
-# ---------------------------
-
-%.o:	%.c
-	$(CC) $(DFLAGS) -c $(CFLAGS) $(SDL_CFLAGS) -o $@ $<
-%.o:	../Shaders/Compiled/%.c
-	$(CC) $(DFLAGS) -c $(CFLAGS) $(SDL_CFLAGS) -o $@ $^
 
 # ----------------------------------------------------------------------------
 # objects
@@ -247,7 +236,6 @@ SHADER_OBJS = \
 	showtris_vert.o
 
 GLOBJS = \
-	$(SHADER_OBJS) \
 	gl_refrag.o \
 	gl_rlight.o \
 	gl_rmain.o \
@@ -311,15 +299,23 @@ OBJS := strlcat.o \
 	zone.o \
 	$(SYSOBJ_SYS) $(SYSOBJ_MAIN) $(SYSOBJ_RES)
 
+# ---------------------------
+# pattern rules
+# ---------------------------
+
+%.o:	%.cpp
+	$(CXX) $(DFLAGS) -c $(CXXFLAGS) $(SDL_CCFLAGS) -o $@ $<
+%.o:	../Shaders/Compiled/%.c
+	$(CC) $(DFLAGS) -c $(CCFLAGS) $(SDL_CCFLAGS) -o $@ $^
+
 # ------------------------
 # Linux build rules
 # ------------------------
 
-vkquake:	$(OBJS)
-	$(LINKER) $(OBJS) $(LDFLAGS) $(LIBS) $(SDL_LIBS) -o $@
-	$(call do_strip,$@)
+vkquake:	$(OBJS) $(SHADER_OBJS)
+	$(LINKER) $(OBJS) $(SHADER_OBJS) $(LDFLAGS) $(LIBS) $(SDL_LIBS) -o $@
 
-image.o: lodepng.c lodepng.h stb_image_write.h
+image.o: lodepng.cpp lodepng.h stb_image_write.h
 
 release:	vkquake
 debug:

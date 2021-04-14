@@ -201,7 +201,7 @@ VkDeviceSize GL_AllocateFromHeaps(int * num_heaps, glheap_t *** heaps, VkDeviceS
 	{
 		if (i == num_heaps_allocated)
 		{
-			*heaps = realloc(*heaps, sizeof(glheap_t*) * (num_heaps_allocated + 1));
+			*heaps = (glheap_t**) realloc(*heaps, sizeof(glheap_t*) * (num_heaps_allocated + 1));
 			(*heaps)[i] = NULL;
 			*num_heaps = num_heaps_allocated + 1;
 		}

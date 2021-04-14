@@ -13,3 +13,4 @@ Shaders/Compiled/*spv
 Shaders/bintoc.exe
 Shaders/bintoc.obj
 Windows/VisualStudio/.vs
+quake-shareware-data
